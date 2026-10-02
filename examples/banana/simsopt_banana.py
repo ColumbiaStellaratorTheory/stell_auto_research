@@ -51,6 +51,28 @@ SEED_FLAG = "basin_seed"
 # Starting value, not measured: OpenMP reductions make L-BFGS runs differ in the
 # last digits between repeats. Calibrate it by replaying a few runs.
 REPLAY_TOLERANCE = 1e-6
+# Goals follow program.md's "Physics Goals" (lower is better); the rest are recorded.
+METRICS = {
+    "field_error": "min",
+    "qs_error": "min",
+    "boozer_residual": "min",
+    "max_curvature": "min",
+    "iterations": None,
+    "optimizer_success": None,
+    "termination_message": None,
+    "iota_actual": None,
+    "volume_actual": None,
+    "coil_length": None,
+    "coil_coil_dist": None,
+    "coil_surface_dist": None,
+    "surface_vessel_dist": None,
+    "max_force": None,
+    "self_intersecting": None,
+    "objective_J": None,
+    "lead_end_curvature": None,
+    "non_lead_end_curvature": None,
+    "poincare_uniformity": None,
+}
 
 # Solver script defaults, relative to the solver root (the fork's standard layout).
 DEFAULT_SCRIPTS = {
@@ -359,25 +381,25 @@ def _is_missing(v: object) -> bool:
 
 # --- Poincaré validation ----------------------------------------------------
 
-def _run_poincare(run_dir: Path, solver_python: str, poincare_script: Path) -> str | None:
-    """Trace field lines and judge confinement. Returns 'pass'/'fail' or None.
+def _run_poincare(run_dir: Path, solver_python: str, poincare_script: Path) -> tuple[str, float | None]:
+    """Trace field lines and judge confinement: ("pass" | "fail" | "error", uniformity).
 
     The Poincaré script prints phi hit counts to stdout. Field lines that exit
     the surface produce fewer hits; uniformity across phi slices (min/max)
-    indicates confinement quality.
+    indicates confinement quality. "error" means the check could not judge
+    (missing script or coils, timeout, crash, unparseable output).
     """
     if not poincare_script.exists():
         print(f"Poincare script not found: {poincare_script}", file=sys.stderr)
-        return None
+        return "error", None
 
-    bs_files = list(run_dir.rglob("biot_savart_opt.json"))
+    bs_files = sorted(run_dir.rglob("biot_savart_opt.json"))
     if not bs_files:
         print("No biot_savart_opt.json for Poincare", file=sys.stderr)
-        return None
-    out_dir = str(bs_files[0].parent)
+        return "error", None
 
     env = os.environ.copy()
-    env["POINCARE_OUT_DIR"] = out_dir
+    env["POINCARE_OUT_DIR"] = str(bs_files[0].parent)
 
     try:
         result = subprocess.run(
@@ -386,30 +408,31 @@ def _run_poincare(run_dir: Path, solver_python: str, poincare_script: Path) -> s
         )
     except subprocess.TimeoutExpired:
         print("Poincare timed out after 600s", file=sys.stderr)
-        return None
+        return "error", None
 
     if result.returncode != 0:
         print(f"Poincare failed (exit {result.returncode})", file=sys.stderr)
-        return None
+        return "error", None
 
     for line in result.stdout.splitlines():
         if "phi hit counts=" not in line:
             continue
         try:
-            counts_str = line.split("phi hit counts=")[1].strip()
-            counts = json.loads(counts_str)
-            if not isinstance(counts, list) or not counts:
-                continue
-            counts = [c for c in counts if isinstance(c, (int, float)) and c is not None]
-            if not counts or max(counts) == 0:
-                return "fail"
-            uniformity = min(counts) / max(counts)
-            return "pass" if uniformity > POINCARE_SURVIVAL_THRESHOLD else "fail"
-        except Exception:
+            counts = json.loads(line.split("phi hit counts=")[1].strip())
+        except json.JSONDecodeError:
             continue
+        if not isinstance(counts, list):
+            continue
+        counts = [c for c in counts if isinstance(c, (int, float))]
+        if not counts:
+            continue
+        if max(counts) == 0:
+            return "fail", 0.0
+        uniformity = min(counts) / max(counts)
+        return ("pass" if uniformity > POINCARE_SURVIVAL_THRESHOLD else "fail"), uniformity
 
     print("Could not parse Poincare output", file=sys.stderr)
-    return None
+    return "error", None
 
 
 def _archive_stage2_seed(run: RunContext, plasma_surf: str, seed_store: Path) -> None:
@@ -536,9 +559,13 @@ def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutco
         fe = metrics.get("field_error")
         if fe is not None and not _is_missing(fe) and fe < POINCARE_FIELD_ERROR_THRESHOLD:
             try:
-                validated = _run_poincare(run.dir, solver_python, solver_root / config.scripts["poincare"])
+                validated, metrics["poincare_uniformity"] = _run_poincare(
+                    run.dir, solver_python, solver_root / config.scripts["poincare"]
+                )
             except Exception as e:
+                # Keep the solver result: a broken check is a validation error, not a crash.
                 print(f"WARNING: Poincare validation failed: {e}", file=sys.stderr)
+                validated = "error"
 
     if args.solver == "stage2":
         try:

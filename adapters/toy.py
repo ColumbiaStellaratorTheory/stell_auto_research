@@ -38,6 +38,13 @@ SEED_FLAG = "seed"
 # The toy solver is pure Python on one thread: a replay must reproduce the
 # original exactly, up to float printing.
 REPLAY_TOLERANCE = 1e-12
+METRICS = {
+    "objective_J": "min",
+    "distance_to_optimum": "min",
+    "iterations": None,
+    "optimizer_success": None,
+    "final_step": None,
+}
 
 SOLVER_SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "toy_solver.py"
 

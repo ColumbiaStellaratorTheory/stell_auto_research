@@ -90,6 +90,22 @@ class TestSeedLineage(unittest.TestCase):
         self.assertIsNone(banana._seed_parent_run(legacy / "biot_savart_opt.json"))
 
 
+class TestPoincare(unittest.TestCase):
+    """A check that cannot run reports "error", never a pass/fail verdict."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_missing_script_is_an_error(self):
+        self.assertEqual(banana._run_poincare(self.root, "/py", self.root / "absent.py"), ("error", None))
+
+    def test_missing_coils_is_an_error(self):
+        script = self.root / "poincare.py"
+        script.write_text("")
+        self.assertEqual(banana._run_poincare(self.root, "/py", script), ("error", None))
+
+
 class TestClassify(unittest.TestCase):
     """The adapter classifies canonical metrics into pass/fail."""
 

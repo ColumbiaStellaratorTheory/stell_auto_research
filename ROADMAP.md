@@ -35,14 +35,14 @@ campaign  (one research goal)
 
 ## Step 3 — analysis and token efficiency
 
-- [ ] 14. Crash signatures parsed from the run log (replaces `exit_N`).
-- [ ] 15. Validation as a number (e.g. Poincaré uniformity) with not-run / error / pass / fail distinguished.
-- [ ] 16. Contract field `METRICS` (name → goal). `run.py brief`: fixed-size digest — Pareto front from `METRICS` goals, latest runs, crash causes, coverage, runs since last improvement, noise floor, machine settings.
-- [ ] 17. Compact stdout (id, status, key metrics, delta vs front, duplicate flag).
-- [ ] 18. `run.py query "SQL"`: read-only, compact output, works on every OS (no `sqlite3` CLI needed).
-- [ ] 19. Typed `LESSONS.md` entries; batch proposals must cite or reject relevant lessons.
-- [ ] 20. `run.py campaigns`: every campaign with status, slots in use, latest result, stall state.
-- [ ] 21. Explicit lesson import from another campaign as priors.
+- [x] 14. Crash signatures: the core reads the tail of the adapter's `log` evidence and records `crash_signature` (last `...Error:` line, else last line; paths/numbers normalized) next to the machine `status_reason` (`exit_N` kept). Schema v3; record-backed v2 DBs are rebuilt automatically.
+- [x] 15. `validated` is pass / fail / error / None (not attempted); banana records `poincare_uniformity` and turns a broken check into `error` instead of losing the run.
+- [x] 16. Contract field `METRICS` (name → "min" / "max" / None, validated by the loader). `run.py brief`: fixed-size digest — counts per mode/target, Pareto fronts, recent runs, crash causes, replicate spread (noise floor), runs since the front last moved, latest lesson titles. (Machine settings move to step 5.)
+- [x] 17. Compact stdout: set identity fields, metrics, `crash_signature`, and `on_front` for passing runs (front membership instead of a numeric delta); duplicates print `duplicate_of`.
+- [x] 18. `run.py query "SQL"`: one read-only statement (`mode=ro`), tab-separated, capped at 50 rows (`--limit`), long cells truncated; no `sqlite3` CLI needed.
+- [x] 19. Typed `LESSONS.md` template (kind / scope / claim / evidence / action / status, closed vocabularies); the program template's loop asks the agent to name the lessons each experiment applies, tests or rejects. (Enforcing it in batch files is item 22.)
+- [x] 20. `run.py campaigns`: every campaign with adapter, run counts, last run, runs since its front moved; read-only. (Slots in use come with item 26.)
+- [x] 21. `run.py import-lessons --from OTHER`: appends the other campaign's entries under one dated `kind: import` entry with headings demoted, marked as hypotheses.
 
 ## Step 4 — batches
 

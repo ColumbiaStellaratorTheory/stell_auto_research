@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import ModuleType
 
 from adapters import REGISTRY
+from contract import METRIC_GOALS
 
 CONTRACT_MEMBERS = (
     "NAME",
@@ -21,6 +22,7 @@ CONTRACT_MEMBERS = (
     "EXECUTION_FLAGS",
     "SEED_FLAG",
     "REPLAY_TOLERANCE",
+    "METRICS",
     "add_arguments",
     "solver_identity",
     "run_experiment",
@@ -44,5 +46,10 @@ def load_adapter(name: str, registry: dict[str, ModuleType] = REGISTRY) -> Modul
         raise AdapterError(
             f"adapter '{name}' does not implement the contract — missing "
             f"{', '.join(missing)} (see contract.py)."
+        )
+    bad_goals = {k: v for k, v in module.METRICS.items() if v not in METRIC_GOALS}
+    if bad_goals:
+        raise AdapterError(
+            f"adapter '{name}' METRICS goals must be \"min\", \"max\" or None: {bad_goals}"
         )
     return module

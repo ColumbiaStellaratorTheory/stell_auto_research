@@ -85,10 +85,12 @@ Match `--iota-target` to the equilibrium's iota value.
 
 ## Querying Results
 
-Query `campaigns/banana/results.db` directly with sqlite3. You have full SQL access.
+Start each iteration with `python run.py brief --campaign banana`: counts per mode/equilibrium, Pareto fronts over field_error / qs_error / boozer_residual / max_curvature, recent runs, crash causes, replicate spread.
+
+For anything else, run read-only SQL (tab-separated, capped at 50 rows):
 
 ```bash
-sqlite3 campaigns/banana/results.db -header -column "YOUR QUERY"
+python run.py query --campaign banana "YOUR QUERY"
 ```
 
 ### Schema
@@ -97,7 +99,7 @@ sqlite3 campaigns/banana/results.db -header -column "YOUR QUERY"
 runs(
   id, coil_type, solver, equilibrium, experiment_group,
   spec_hash, replicate, seed, parent_run_id, replay_of,
-  status, status_reason, validated,
+  status, status_reason, crash_signature, validated,
   iterations, elapsed, created_at, optimizer_success, termination_message,
   field_error, qs_error, boozer_residual,
   iota_actual, volume_actual,

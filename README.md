@@ -109,7 +109,8 @@ run.py  →  adapter.run_experiment(args, run)  →  ExperimentOutcome  →  run
 The adapter (see `contract.py` for the interface) owns everything about your
 solver: which flags exist (`add_arguments`), which modes it has
 (`SOLVER_MODES`), which flag names the target configuration (`TARGET_FLAG`),
-which flag is its RNG seed (`SEED_FLAG`), what fingerprints its code
+which flag is its RNG seed (`SEED_FLAG`), which metrics it emits and whether
+each should go down or up (`METRICS`), what fingerprints its code
 (`solver_identity`), and how to run one experiment end-to-end
 (`run_experiment`) — whether that's a single subprocess or a chained pipeline.
 It returns metrics as canonical keys plus what the run used (provenance) and
@@ -139,6 +140,22 @@ of every run, so no flag is ever lost.
   `results.jsonl` from `runs/`. `--from-jsonl FILE` first imports records
   from an older harness's `results.jsonl`.
 
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `python run.py [--campaign C] <adapter flags>` | run one experiment; prints a compact JSON summary (set fields, metrics, `on_front`, `crash_signature`) |
+| `python run.py brief [--campaign C]` | fixed-size digest: counts per mode/target, Pareto fronts over the adapter's goal metrics, recent runs, crash causes, replicate spread, runs since the front last moved, latest lessons |
+| `python run.py query "SQL" [--limit N]` | one read-only SQL statement, tab-separated, capped (default 50 rows) |
+| `python run.py replay <run-id>` | re-run a recorded experiment and compare |
+| `python run.py rebuild [--from-jsonl FILE]` | regenerate `results.db` / `results.jsonl` from `runs/` |
+| `python run.py campaigns` | every campaign: adapter, run counts, last run, runs since its front moved |
+| `python run.py import-lessons --from OTHER` | append another campaign's lessons to this one's `LESSONS.md`, marked as priors |
+
+A crashed run's `crash_signature` is the line in its log that names the failure
+(the last `...Error:` line, else the last line), with paths and numbers
+normalized so the same failure groups together across runs.
+
 ## Environment variables
 
 | Variable | Description |
@@ -159,13 +176,11 @@ solver-specific metrics live in the `metrics` JSON column, every flag of the
 run in `params`, and provenance/evidence in their own JSON columns.
 
 ```bash
-DB=campaigns/<name>/results.db
-
-# SQLite (recommended for agents)
-sqlite3 $DB -header -column "SELECT * FROM runs WHERE status='pass' ORDER BY objective_J LIMIT 10"
+# read-only SQL through the harness (recommended for agents; works without the sqlite3 CLI)
+python run.py query --campaign <name> "SELECT id, objective_J FROM runs WHERE status='pass' ORDER BY objective_J LIMIT 10"
 
 # a solver-specific metric or parameter from the JSON columns
-sqlite3 $DB "SELECT id, json_extract(metrics,'\$.<your_metric>'), json_extract(params,'\$.<your_flag>') FROM runs"
+python run.py query --campaign <name> "SELECT id, json_extract(metrics,'$.<your_metric>'), json_extract(params,'$.<your_flag>') FROM runs"
 
 # flat files (for scripts, jq, grep)
 jq 'select(.status=="pass")' campaigns/<name>/runs/*.json
@@ -204,6 +219,7 @@ column.
 ```
 contract.py                     ← harness↔adapter contract (ExperimentOutcome, helpers)
 run.py                          ← generic experiment runner (solver-agnostic)
+analysis.py                     ← derived views: crash signatures, Pareto fronts, the brief
 adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)

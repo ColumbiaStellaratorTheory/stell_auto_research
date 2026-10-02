@@ -13,6 +13,7 @@ and the DB index.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -25,6 +26,7 @@ import unittest
 from pathlib import Path
 
 import adapter
+import analysis
 import contract
 import run
 from adapters import toy
@@ -254,9 +256,20 @@ class TestBuildRecord(unittest.TestCase):
         self.assertEqual(set(provenance["harness"]), {"commit", "dirty"})
         self.assertEqual(set(provenance["platform"]), {"os", "release", "machine", "python"})
 
-    def test_summary_leaves_out_provenance_and_evidence(self):
-        record = self._record(contract.ExperimentOutcome("pass", "ok"))
-        self.assertFalse({"provenance", "evidence"} & set(run.summary(record)))
+    def test_summary_is_compact(self):
+        record = self._record(contract.ExperimentOutcome("pass", "ok", metrics={"objective_J": 0.5}))
+        printed = run.summary(record, on_front=True)
+        self.assertFalse({"provenance", "evidence", "params", "spec_hash", "field_error"} & set(printed))
+        self.assertEqual((printed["metrics"], printed["on_front"]), ({"objective_J": 0.5}, True))
+
+    def test_summary_carries_crash_signature_and_omits_on_front_for_non_pass(self):
+        record = run._build_record(
+            toy, _toy_args(seed=1), contract.ExperimentOutcome("crash", "exit_1"), 0.0,
+            run_id="r", digest="h", solver_identity="v", evidence={}, crash_signature="ValueError: bad",
+        )
+        printed = run.summary(record, on_front=None)
+        self.assertEqual(printed["crash_signature"], "ValueError: bad")
+        self.assertNotIn("on_front", printed)
 
 
 class TestEvidenceAndRecords(_ScratchDirTest):
@@ -379,8 +392,8 @@ class TestExecute(_ScratchDirTest):
         self.assertFalse((self.root / "artifacts").exists(), "no artifacts dir under 'none'")
 
 
-class TestEndToEnd(_ScratchDirTest):
-    """run.py as the agent calls it: real toy runs recorded in the campaign."""
+class _CliTest(_ScratchDirTest):
+    """Runs run.py as a subprocess against a scratch campaigns directory."""
 
     def setUp(self):
         super().setUp()
@@ -404,6 +417,10 @@ class TestEndToEnd(_ScratchDirTest):
     def _run_files(self, campaign: Path | None = None) -> list[Path]:
         return sorted(((campaign or self.demo) / "runs").glob("*.json"))
 
+
+class TestEndToEnd(_CliTest):
+    """run.py as the agent calls it: real toy runs recorded in the campaign."""
+
     def test_passing_run_is_recorded_as_file_and_db_row(self):
         printed = self._json("--problem", "sphere", "--dim", "3", "--maxiter", "500")
         self.assertEqual((printed["status"], printed["equilibrium"]), ("pass", "sphere"))
@@ -412,9 +429,10 @@ class TestEndToEnd(_ScratchDirTest):
         self.assertEqual(record["provenance"]["adapter"]["command"][2:4], ["--problem", "sphere"])
         log_hash = record["evidence"]["log"]["sha256"]
         self.assertTrue((self.demo / "blobs" / log_hash[:2] / log_hash).exists())
+        self.assertTrue(printed["on_front"], "the only passing run is on its front")
         with sqlite3.connect(self.demo / "results.db") as db:
             row = db.execute("SELECT id, seed, spec_hash FROM runs").fetchone()
-        self.assertEqual(row, (printed["id"], printed["seed"], printed["spec_hash"]))
+        self.assertEqual(row, (printed["id"], printed["seed"], record["spec_hash"]))
         self.assertFalse((self.demo / "scratch" / printed["id"]).exists(), "scratch cleaned under 'none'")
 
     def test_identical_spec_is_not_run_twice(self):
@@ -427,7 +445,6 @@ class TestEndToEnd(_ScratchDirTest):
         first = self._json("--problem", "rastrigin", "--maxiter", "50")
         second = self._json("--problem", "rastrigin", "--maxiter", "50", "--replicate", "1")
         self.assertNotEqual(first["seed"], second["seed"])
-        self.assertNotEqual(first["spec_hash"], second["spec_hash"])
         self.assertEqual(len(self._run_files()), 2)
 
     def test_crash_does_not_block_a_retry(self):
@@ -497,6 +514,100 @@ class TestEndToEnd(_ScratchDirTest):
         proc = self._run("--campaign", "broken")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no adapter 'nope'", proc.stderr)
+
+
+
+class TestSchemaUpgrade(_ScratchDirTest):
+    """A DB from a record-backed older schema is rebuilt from runs/ automatically."""
+
+    def test_v2_db_is_rebuilt_on_open(self):
+        layout = self._layout()
+        run.write_run_record(layout.runs_dir, {
+            "id": "r1", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
+            "status": "crash", "status_reason": "exit_1", "created_at": "2026-01-01",
+        })
+        with sqlite3.connect(layout.db_path) as db:
+            db.execute("CREATE TABLE runs (id TEXT)")
+            db.execute("PRAGMA user_version = 2")
+        with contextlib.closing(run.open_db(layout)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
+            self.assertEqual(db.execute("SELECT id, crash_signature FROM runs").fetchall(), [("r1", None)])
+
+
+class TestSpecBase(unittest.TestCase):
+    """Replicates of one spec share a spec_base whatever their seeds."""
+
+    def test_seed_and_execution_flags_do_not_change_it(self):
+        a = run.spec_base(toy, run.run_spec(_toy_args(seed=1, timeout=5)))
+        b = run.spec_base(toy, run.run_spec(_toy_args(seed=2, timeout=50)))
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, run.spec_base(toy, run.run_spec(_toy_args(dim=9))))
+
+
+class TestLoaderMetrics(unittest.TestCase):
+    """METRICS goals must be min, max or None."""
+
+    def test_bad_goal_is_rejected(self):
+        bad = types.SimpleNamespace(**{m: None for m in adapter.CONTRACT_MEMBERS})
+        bad.METRICS = {"error": "lower"}
+        with self.assertRaisesRegex(adapter.AdapterError, "METRICS goals"):
+            adapter.load_adapter("bad", {"bad": bad})
+
+
+class TestQueryAndLessons(_ScratchDirTest):
+    """query is read-only and capped; lessons import as marked priors."""
+
+    def _layout_with_runs(self, n: int) -> run.Layout:
+        layout = self._layout()
+        for i in range(n):
+            run.write_run_record(layout.runs_dir, {
+                "id": f"r{i}", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
+                "status": "pass", "status_reason": "ok", "created_at": f"2026-01-{i + 1:02d}",
+                "objective_J": float(i),
+            })
+        run.rebuild(layout)
+        return layout
+
+    def test_query_returns_header_and_rows(self):
+        out = run.query(self._layout_with_runs(2), "SELECT id, objective_J FROM runs ORDER BY id", 10)
+        self.assertEqual(out.splitlines(), ["id\tobjective_J", "r0\t0", "r1\t1"])
+
+    def test_query_is_capped(self):
+        out = run.query(self._layout_with_runs(5), "SELECT id FROM runs", 2)
+        self.assertEqual(len(out.splitlines()), 4)
+        self.assertIn("more than 2 rows", out)
+
+    def test_query_cannot_write(self):
+        layout = self._layout_with_runs(1)
+        with self.assertRaisesRegex(run.HarnessError, "readonly"):
+            run.query(layout, "DELETE FROM runs", 10)
+
+    def test_import_lessons_demotes_headings_under_one_marked_entry(self):
+        source, target = self.root / "src", self.root / "dst"
+        source.mkdir(), target.mkdir()
+        (source / run.LESSONS_NAME).write_text("# L\n\n## 2026-01-01 — use restarts\n- kind: recipe\n")
+        (target / run.LESSONS_NAME).write_text("# L\n")
+        self.assertEqual(run.import_lessons(source, target), 1)
+        text = (target / run.LESSONS_NAME).read_text()
+        self.assertIn("### 2026-01-01 — use restarts", text)
+        self.assertEqual(len(analysis.lesson_titles(text)), 1, "imported entries are not this campaign's own")
+        self.assertIn("Imported 1 lessons from campaign src", analysis.lesson_titles(text)[0])
+
+
+class TestCommandsEndToEnd(_CliTest):
+    """brief, query, campaigns and crash signatures through the real CLI."""
+
+    def test_crash_carries_its_signature(self):
+        self.assertEqual(self._json("--inject", "crash")["crash_signature"], "injected crash")
+
+    def test_brief_query_and_campaigns(self):
+        self._json("--problem", "sphere", "--maxiter", "50")
+        brief = self._run("brief")
+        self.assertIn("campaign demo · adapter toy · 1 runs: 1 pass", brief.stdout, brief.stderr)
+        rows = self._run("query", "SELECT status, COUNT(*) FROM runs GROUP BY status").stdout.splitlines()
+        self.assertEqual(rows, ["status\tCOUNT(*)", "pass\t1"])
+        table = self._run("campaigns").stdout.splitlines()
+        self.assertEqual(table[1].split("\t")[:4], ["demo", "toy", "1", "1"])
 
 
 if __name__ == "__main__":

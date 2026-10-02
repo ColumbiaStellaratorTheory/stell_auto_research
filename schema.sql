@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS runs (
     -- outcome
     status                  TEXT NOT NULL,
     status_reason           TEXT,
+    crash_signature         TEXT,            -- normalized line from the log naming why a crash died
     validated               TEXT,
     iterations              INTEGER,
     elapsed                 REAL,
@@ -53,6 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_group        ON runs(experiment_group);
 CREATE INDEX IF NOT EXISTS idx_runs_spec         ON runs(spec_hash, replicate);
 CREATE INDEX IF NOT EXISTS idx_runs_parent       ON runs(parent_run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status       ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_crash        ON runs(crash_signature);
 CREATE INDEX IF NOT EXISTS idx_runs_validated    ON runs(validated);
 CREATE INDEX IF NOT EXISTS idx_runs_fe           ON runs(field_error);
 CREATE INDEX IF NOT EXISTS idx_runs_qs           ON runs(qs_error);

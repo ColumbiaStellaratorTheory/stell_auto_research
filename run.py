@@ -9,8 +9,12 @@ contract.py) owns everything solver-specific.
 Usage (experiment flags come from the campaign's adapter; this shows the toy):
     python run.py --campaign demo --problem rastrigin --dim 4      # run one experiment
     python run.py --campaign demo --problem rastrigin --replicate 1  # another seed of it
+    python run.py brief --campaign demo                            # fixed-size campaign digest
+    python run.py query "SELECT ..." --campaign demo               # read-only SQL, compact output
     python run.py replay <run-id> --campaign demo                  # re-run and compare
     python run.py rebuild --campaign demo [--from-jsonl FILE]      # regenerate results.db/.jsonl
+    python run.py campaigns                                        # every campaign at a glance
+    python run.py import-lessons --from other --campaign demo      # another campaign's lessons as priors
 
 `--campaign` (or $AUTORESEARCH_CAMPAIGN) may be omitted when exactly one
 campaign exists. Each run is written atomically to the campaign's
@@ -32,22 +36,31 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Mapping, MutableMapping
 
+import analysis
 from adapter import AdapterError, load_adapter
 from contract import ExperimentOutcome, RunContext, clean, git_output, sha256_file
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# From this version on every DB row has a run file, so an older DB can be
+# rebuilt from runs/ without losing anything.
+FIRST_RECORD_BACKED_VERSION = 2
 CONFIG_NAME = "config.json"
 CAMPAIGN_ENV = "AUTORESEARCH_CAMPAIGN"
 CAMPAIGNS_DIR_ENV = "AUTORESEARCH_CAMPAIGNS_DIR"
 KEEP_ARTIFACTS_CHOICES = ("none", "pass", "all")
-COMMANDS = ("replay", "rebuild")
+COMMANDS = ("replay", "rebuild", "brief", "query", "campaigns", "import-lessons")
+LESSONS_NAME = "LESSONS.md"
+QUERY_DEFAULT_LIMIT = 50
+QUERY_CELL_CHARS = 120
+LOG_TAIL_BYTES = 64 * 1024
 # Core flags that select how the harness runs, not what the solver computes.
 CORE_FLAGS = ("campaign", "replicate")
 # Prior results that make a repeat redundant; a crash can always be retried.
@@ -77,13 +90,21 @@ COLUMN_METRIC_KEYS = (
 IDENTITY_COLUMNS = (
     "id", "coil_type", "solver", "equilibrium", "experiment_group",
     "spec_hash", "replicate", "seed", "parent_run_id", "replay_of",
-    "status", "status_reason", "validated", "elapsed", "created_at",
+    "status", "status_reason", "crash_signature", "validated", "elapsed", "created_at",
 )
 JSON_COLUMNS = ("metrics", "params", "provenance", "evidence")
 BOOL_COLUMNS = ("optimizer_success", "self_intersecting")
 DB_COLUMNS = IDENTITY_COLUMNS + COLUMN_METRIC_KEYS + JSON_COLUMNS
-# Record fields kept out of the stdout summary (they stay in the run file).
-DETAIL_FIELDS = ("provenance", "evidence")
+# Identity fields shown in the stdout summary when set; metrics follow.
+SUMMARY_FIELDS = (
+    "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
+    "validated", "parent_run_id", "replay_of", "replicate", "seed", "elapsed",
+)
+# Run fields the analysis views carry besides metric values.
+VIEW_FIELDS = (
+    "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
+    "validated", "created_at", "replicate", "seed",
+)
 
 
 class HarnessError(Exception):
@@ -290,14 +311,24 @@ def _hashed_fields(active: ModuleType, spec: Mapping[str, object]) -> dict:
     return {k: v for k, v in spec.items() if k not in active.EXECUTION_FLAGS}
 
 
+def _seedless_fields(active: ModuleType, spec: Mapping[str, object]) -> dict:
+    return {k: v for k, v in _hashed_fields(active, spec).items() if k != active.SEED_FLAG}
+
+
+def spec_base(active: ModuleType, spec: Mapping[str, object]) -> str:
+    """Hash shared by every replicate of a spec: no seed, no execution flags, no solver."""
+    return _canonical_hash({"adapter": active.NAME, "spec": _seedless_fields(active, spec)})
+
+
 def derive_seed(active: ModuleType, spec: Mapping[str, object], replicate: int) -> int:
     """Seed for an unset SEED_FLAG: a function of the spec (minus the seed) and replicate.
 
     Independent of the solver identity, so the same experiment keeps its seed
     across solver versions and their results stay comparable.
     """
-    fields = {k: v for k, v in _hashed_fields(active, spec).items() if k != active.SEED_FLAG}
-    digest = _canonical_hash({"adapter": active.NAME, "spec": fields, "replicate": replicate})
+    digest = _canonical_hash(
+        {"adapter": active.NAME, "spec": _seedless_fields(active, spec), "replicate": replicate}
+    )
     return int(digest[:8], 16) % 2**31
 
 
@@ -391,18 +422,31 @@ def _create_schema(db: sqlite3.Connection) -> None:
     db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def open_db(layout: Layout) -> sqlite3.Connection:
-    """Open the campaign's DB, creating it if absent; refuse an outdated schema."""
-    db = sqlite3.connect(str(layout.db_path))
+def _schema_version(db: sqlite3.Connection) -> int | None:
+    """The DB's schema version, or None when it has no runs table yet."""
     has_runs = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
     ).fetchone()
-    if not has_runs:
+    return db.execute("PRAGMA user_version").fetchone()[0] if has_runs else None
+
+
+def open_db(layout: Layout) -> sqlite3.Connection:
+    """Open the campaign's DB, creating it if absent.
+
+    A DB from an older record-backed schema is rebuilt from runs/; one from
+    before run files existed is refused with the command that imports it.
+    """
+    db = sqlite3.connect(str(layout.db_path))
+    version = _schema_version(db)
+    if version is None:
         _create_schema(db)
         return db
-    version = db.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
         db.close()
+        if version >= FIRST_RECORD_BACKED_VERSION:
+            print(f"results.db schema {version} -> {SCHEMA_VERSION}: rebuilding from runs/", file=sys.stderr)
+            rebuild(layout)
+            return sqlite3.connect(str(layout.db_path))
         jsonl_hint = f" --from-jsonl {layout.jsonl_path}" if layout.jsonl_path.exists() else ""
         raise HarnessError(
             f"{layout.db_path} has schema version {version}, this harness needs "
@@ -502,6 +546,7 @@ def _build_record(
     digest: str,
     solver_identity: str,
     evidence: Mapping[str, object],
+    crash_signature: str | None = None,
     replay_of: str | None = None,
 ) -> dict:
     """Assemble a run record from an adapter outcome. NaN cleaning happens here.
@@ -523,6 +568,7 @@ def _build_record(
         "replay_of": replay_of,
         "status": outcome.status,
         "status_reason": outcome.status_reason,
+        "crash_signature": crash_signature,
         "validated": outcome.validated,
         "elapsed": round(elapsed, 1),
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -543,9 +589,63 @@ def _build_record(
     return record
 
 
-def summary(record: Mapping[str, object]) -> dict:
-    """The stdout view of a record: everything except the bulky provenance/evidence."""
-    return {k: v for k, v in record.items() if k not in DETAIL_FIELDS}
+def metric_values(record: Mapping[str, object]) -> dict:
+    """Every non-null metric of a record: column metrics plus the JSON overflow."""
+    values = {k: record.get(k) for k in COLUMN_METRIC_KEYS}
+    values.update(record.get("metrics") or {})
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def summary(record: Mapping[str, object], on_front: bool | None) -> dict:
+    """The compact stdout view of a record: set identity fields, metrics, front membership.
+
+    Provenance, evidence, params and empty fields stay in the run file.
+    """
+    out = {k: record[k] for k in SUMMARY_FIELDS if record.get(k) is not None}
+    out["metrics"] = metric_values(record)
+    if on_front is not None:
+        out["on_front"] = on_front
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Analysis views (see analysis.py)
+# ---------------------------------------------------------------------------
+
+def _read_views(db: sqlite3.Connection, active: ModuleType) -> list[dict]:
+    db.row_factory = sqlite3.Row
+    columns = ", ".join(VIEW_FIELDS + COLUMN_METRIC_KEYS + ("metrics", "params"))
+    views = []
+    for row in db.execute(f"SELECT {columns} FROM runs"):
+        record = dict(row)
+        record["metrics"] = json.loads(record["metrics"] or "{}")
+        views.append({
+            **{k: record[k] for k in VIEW_FIELDS},
+            "values": metric_values(record),
+            "spec_base": spec_base(active, json.loads(record["params"] or "{}")),
+        })
+    return views
+
+
+def load_views(layout: Layout, active: ModuleType) -> list[dict]:
+    if not layout.db_path.exists():
+        return []
+    with contextlib.closing(open_db(layout)) as db:
+        return _read_views(db, active)
+
+
+def _tail_text(path: Path, max_bytes: int = LOG_TAIL_BYTES) -> str:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - max_bytes))
+        return f.read().decode(errors="replace")
+
+
+def _log_signature(outcome: ExperimentOutcome) -> str | None:
+    log = outcome.evidence.get("log")
+    if outcome.status != "crash" or log is None or not log.is_file():
+        return None
+    return analysis.crash_signature(_tail_text(log))
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +686,7 @@ def execute(
     record = _build_record(
         active, args, outcome, elapsed,
         run_id=run_id, digest=digest, solver_identity=identity, evidence=evidence,
-        replay_of=replay_of,
+        crash_signature=_log_signature(outcome), replay_of=replay_of,
     )
     write_run_record(layout.runs_dir, record)
     index_record(layout, record)
@@ -608,7 +708,11 @@ def run_once(active: ModuleType, layout: Layout, args: argparse.Namespace) -> No
                           "status_reason": duplicate["status_reason"],
                           "spec_hash": digest, "replicate": args.replicate}))
         return
-    print(json.dumps(summary(execute(active, layout, args, identity))))
+    record = execute(active, layout, args, identity)
+    on_front = None
+    if record["status"] == "pass":
+        on_front = record["id"] in analysis.front_ids(load_views(layout, active), active.METRICS)
+    print(json.dumps(summary(record, on_front)))
 
 
 def _finalize_run_dir(layout: Layout, run_dir: Path, status: str, run_id: str) -> None:
@@ -629,12 +733,6 @@ def _finalize_run_dir(layout: Layout, run_dir: Path, status: str, run_id: str) -
 # Replay
 # ---------------------------------------------------------------------------
 
-def _metric_values(record: Mapping[str, object]) -> dict:
-    values = {k: record.get(k) for k in COLUMN_METRIC_KEYS}
-    values.update(record.get("metrics") or {})
-    return {k: v for k, v in values.items() if v is not None}
-
-
 def _differs(a: object, b: object, tolerance: float) -> bool:
     numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (a, b))
     if not numeric:
@@ -648,7 +746,7 @@ def compare_runs(original: Mapping[str, object], replay: Mapping[str, object], t
     mismatches = []
     if original.get("status") != replay.get("status"):
         mismatches.append({"field": "status", "original": original.get("status"), "replay": replay.get("status")})
-    before, after = _metric_values(original), _metric_values(replay)
+    before, after = metric_values(original), metric_values(replay)
     for key in sorted(before.keys() | after.keys()):
         a, b = before.get(key), after.get(key)
         if a is None or b is None or _differs(a, b, tolerance):
@@ -680,6 +778,108 @@ def replay(active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, 
 
 
 # ---------------------------------------------------------------------------
+# Brief, query, campaigns, lessons
+# ---------------------------------------------------------------------------
+
+def read_lessons(campaign_dir: Path) -> str:
+    path = campaign_dir / LESSONS_NAME
+    return path.read_text() if path.exists() else ""
+
+
+def brief(active: ModuleType, layout: Layout) -> str:
+    return analysis.render_brief(
+        layout.campaign_dir.name,
+        active.NAME,
+        load_views(layout, active),
+        active.METRICS,
+        analysis.lesson_titles(read_lessons(layout.campaign_dir)),
+    )
+
+
+def _cell(value: object) -> str:
+    text = analysis.fmt(value) if value is not None else ""
+    text = text.replace("\t", " ").replace("\n", " ")
+    return text if len(text) <= QUERY_CELL_CHARS else text[: QUERY_CELL_CHARS - 1] + "…"
+
+
+def query(layout: Layout, sql: str, limit: int) -> str:
+    """Run one read-only SQL statement; return tab-separated rows (header first), capped."""
+    if not layout.db_path.exists():
+        raise HarnessError(f"no {layout.db_path} yet: run an experiment first")
+    with contextlib.closing(open_db(layout)):
+        pass  # creates or upgrades the schema before the read-only connection
+    uri = f"{layout.db_path.resolve().as_uri()}?mode=ro"
+    try:
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+            cursor = db.execute(sql)
+            columns = [d[0] for d in cursor.description or ()]
+            rows = cursor.fetchmany(limit + 1)
+    except sqlite3.Error as e:
+        raise HarnessError(f"query failed: {e}") from e
+    lines = ["\t".join(columns)] + ["\t".join(_cell(v) for v in row) for row in rows[:limit]]
+    if len(rows) > limit:
+        lines.append(f"… more than {limit} rows; aggregate, or raise --limit")
+    return "\n".join(lines)
+
+
+def campaign_status(campaign_dir: Path) -> list[str]:
+    """One row of `run.py campaigns` for this campaign, without modifying anything."""
+    name = campaign_dir.name
+    try:
+        active = load_adapter(load_config(campaign_dir).adapter)
+    except (HarnessError, AdapterError) as e:
+        return [name, f"error: {e}", "", "", "", "", "", ""]
+    db_path = campaign_dir / "results.db"
+    if not db_path.exists():
+        return [name, active.NAME, "0", "0", "0", "0", "-", "-"]
+    with contextlib.closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as db:
+        version = _schema_version(db)
+        if version != SCHEMA_VERSION:
+            return [name, active.NAME, f"schema {version}: run.py rebuild", "", "", "", "", ""]
+        views = _read_views(db, active)
+    counts = Counter(v["status"] for v in views)
+    last = max((v["created_at"] for v in views), default="-")[:19]
+    stall = analysis.runs_since_front_change(views, active.METRICS)
+    return [
+        name, active.NAME, str(len(views)), str(counts["pass"]), str(counts["fail"]),
+        str(counts["crash"]), last, "-" if stall is None else str(stall),
+    ]
+
+
+def campaigns_table(root: Path) -> str:
+    header = "campaign\tadapter\truns\tpass\tfail\tcrash\tlast_run\truns_since_front"
+    rows = ["\t".join(campaign_status(root / name)) for name in list_campaigns(root)]
+    return "\n".join([header, *rows]) if rows else f"no campaigns under {root}"
+
+
+def import_lessons(source_dir: Path, target_dir: Path) -> int:
+    """Append the source campaign's lesson entries to the target's LESSONS.md as priors.
+
+    They go under one dated import entry, with their headings demoted so they
+    are not counted as the target campaign's own lessons. Returns the count.
+    """
+    entries = analysis.lesson_entries(read_lessons(source_dir))
+    if not entries:
+        raise HarnessError(f"no dated entries in {source_dir / LESSONS_NAME}")
+    today = datetime.date.today().isoformat()
+    block = [
+        f"## {today} — Imported {len(entries)} lessons from campaign {source_dir.name}",
+        "",
+        "- kind: import",
+        f"- source: {source_dir / LESSONS_NAME}",
+        "- status: hypothesis — priors from another campaign until this campaign's runs confirm them",
+        "",
+        *[entry.replace("## ", "### ", 1) + "\n" for entry in entries],
+    ]
+    target = target_dir / LESSONS_NAME
+    existing = target.read_text() if target.exists() else ""
+    separator = "" if not existing or existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+    with open(target, "a") as f:
+        f.write(separator + "\n".join(block))
+    return len(entries)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -705,6 +905,11 @@ def build_parser(active: ModuleType, campaign: str | None) -> argparse.ArgumentP
 
 
 def _dispatch(command: str, argv: list[str]) -> int:
+    if command == "campaigns":
+        argparse.ArgumentParser(description="List every campaign").parse_args(argv)
+        print(campaigns_table(campaigns_root(os.environ)))
+        return 0
+
     # Campaign selection comes first: the campaign's adapter defines every
     # other flag, so the full parser can only be built once it is loaded.
     pre = argparse.ArgumentParser(add_help=False)
@@ -725,7 +930,32 @@ def _dispatch(command: str, argv: list[str]) -> int:
         print(json.dumps({"campaign": campaign_dir.name, "imported": imported, "rows": rows}))
         return 0
 
+    if command == "import-lessons":
+        p = argparse.ArgumentParser(description="Append another campaign's lessons as priors")
+        p.add_argument("--from", dest="source", required=True, help="campaign to import from")
+        p.add_argument("--campaign", default=selection.campaign)
+        args = p.parse_args(argv)
+        source_dir = resolve_campaign(args.source, campaigns_root(os.environ))
+        count = import_lessons(source_dir, campaign_dir)
+        print(json.dumps({"campaign": campaign_dir.name, "imported_from": source_dir.name, "entries": count}))
+        return 0
+
     active = load_adapter(config.adapter)
+    if command == "brief":
+        p = argparse.ArgumentParser(description="Fixed-size digest of the campaign")
+        p.add_argument("--campaign", default=selection.campaign)
+        p.parse_args(argv)
+        print(brief(active, layout))
+        return 0
+    if command == "query":
+        p = argparse.ArgumentParser(description="Run one read-only SQL statement on results.db")
+        p.add_argument("sql")
+        p.add_argument("--limit", type=int, default=QUERY_DEFAULT_LIMIT)
+        p.add_argument("--campaign", default=selection.campaign)
+        args = p.parse_args(argv)
+        print(query(layout, args.sql, args.limit))
+        return 0
+
     parser = build_parser(active, selection.campaign)
     if command == "replay":
         p = argparse.ArgumentParser(description="Re-run a recorded experiment and compare")

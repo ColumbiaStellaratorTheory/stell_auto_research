@@ -34,6 +34,11 @@ An adapter is a module exposing:
     REPLAY_TOLERANCE  float        — largest relative difference per numeric
                                      metric for which `run.py replay` reports a
                                      match.
+    METRICS           Mapping[str, str | None]
+                                   — every canonical metric key the adapter
+                                     emits → its goal: "min", "max", or None
+                                     (recorded, not optimized). Goals drive the
+                                     Pareto front in `run.py brief`.
     add_arguments(parser) -> None  — register the solver's CLI flags.
     solver_identity(args) -> str   — fingerprint of the solver code that will
                                      run (e.g. commit + uncommitted-diff hash).
@@ -63,6 +68,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+METRIC_GOALS = ("min", "max", None)
+
 
 @dataclass(frozen=True)
 class RunContext:
@@ -89,15 +96,18 @@ class ExperimentOutcome:
     status_reason: short machine-readable tag, e.g. "ok", "timeout".
     metrics: canonical-key → value. NaN/Inf are cleaned by the core, so adapters
         may pass raw solver floats.
-    validated: independent-validation verdict ("pass"/"fail") when the adapter
-        ran one (e.g. Poincaré field-line tracing), else None.
+    validated: independent-validation verdict — "pass"/"fail" when the check
+        ran and judged, "error" when it was attempted but could not judge,
+        None when it was not attempted. Put the measured quantity behind the
+        verdict (e.g. a survival fraction) in `metrics`.
     experiment_group: groups DB rows of one logical multi-step experiment;
         None when one experiment is one row.
     provenance: what the run actually used, as JSON-able values — the exact
         solver command(s), solver commit, interpreter, hashes of input files.
     evidence: name → file under run.dir worth keeping whatever the artifact
         policy (results file, solver patch, log). The core stores each one by
-        content hash in the campaign and records the hashes.
+        content hash in the campaign and records the hashes. Name the solver's
+        combined output "log": the core derives a crash signature from it.
     parent_run_id: the earlier run this one built on (e.g. the run that
         produced its warm-start seed), when known.
     """

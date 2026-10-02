@@ -112,6 +112,10 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   this is a new goal rather than more runs for an existing campaign.
 - **Success metric**: the one measurable claim that defines success, and how it
   is verified.
+- **Metric goals**: for each metric the solver reports, should it go down,
+  up, or is it only recorded? These become the adapter's `METRICS` and decide
+  which runs `run.py brief` shows on the Pareto front. Keep the goal set to
+  what the user actually optimizes; constraints are not goals.
 - **Hard invariants**: hardware limits, sign/convention contracts, ceilings.
   Offer "none yet" as valid. Remind: every entry removes agent freedom — keep to
   real physical/hardware limits.
@@ -143,11 +147,16 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      `SEED_FLAG` (the solver's RNG seed flag dest with default `None`, or
      `None` if the solver is deterministic), `REPLAY_TOLERANCE` (relative
      per-metric tolerance for `run.py replay`; say in a comment whether it was
-     measured or is a starting value).
+     measured or is a starting value), `METRICS` (every canonical metric key
+     the adapter emits → `"min"`, `"max"` or `None`; the goals come from the
+     interview's evaluation answers and drive the Pareto front in
+     `run.py brief`).
    - `add_arguments(parser)` — register the target flag (with a default) plus
      every solver param the agent may set, with the solver's real defaults.
      Only flags the solver actually supports. The core records every flag, so
      there is no list of "kept" params to maintain.
+   - Name the solver's combined output `"log"` in `evidence`: the core reads
+     its tail to give crashes a `crash_signature`.
    - `solver_identity(args)` — fingerprint of the solver code (commit + hash
      of uncommitted changes via `contract.git_output`, or a file hash).
    - `run_experiment(args, run)` — run one experiment end-to-end in `run.dir`

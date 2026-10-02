@@ -47,7 +47,8 @@ here is a research variable.
 
 1. Read this file completely.
 2. Read `LESSONS.md` (next to this file) — it is your accumulated research memory.
-3. Query the database to understand what has been tried.
+3. Run `python run.py brief --campaign {{CAMPAIGN_SLUG}}` to see what has been
+   tried, the Pareto fronts, recent runs, crash causes and the noise floor.
 4. Start the loop.
 
 ## Solver Modes
@@ -130,11 +131,21 @@ id so the result stays reproducible.
 
 ## Querying Results
 
-Query this campaign's `results.db` directly with sqlite3. You have full SQL access.
+`python run.py brief --campaign {{CAMPAIGN_SLUG}}` gives a fixed-size digest:
+counts per mode/target, the Pareto front of each (over the adapter's goal
+metrics), recent runs, crash causes, replicate spread, and how many runs ago
+the front last moved. Start from it rather than re-deriving the same
+aggregates with SQL.
+
+For anything else, run read-only SQL on this campaign's `results.db`:
 
 ```bash
-sqlite3 campaigns/{{CAMPAIGN_SLUG}}/results.db -header -column "YOUR QUERY"
+python run.py query --campaign {{CAMPAIGN_SLUG}} "YOUR QUERY"
 ```
+
+Output is tab-separated, capped at 50 rows (`--limit N`), with long cells
+truncated. It works on every OS without the `sqlite3` command and cannot
+modify the database.
 
 ### Schema
 
@@ -142,7 +153,7 @@ sqlite3 campaigns/{{CAMPAIGN_SLUG}}/results.db -header -column "YOUR QUERY"
 runs(
   id, coil_type, solver, equilibrium, experiment_group,
   spec_hash, replicate, seed, parent_run_id, replay_of,
-  status, status_reason, validated,
+  status, status_reason, crash_signature, validated,
   iterations, elapsed, created_at, optimizer_success, termination_message,
   field_error, qs_error, boozer_residual,
   iota_actual, volume_actual,
@@ -199,7 +210,9 @@ Hard-won defaults, not rules — override them when you have a reason:
 - **Append** an entry whenever a finding generalizes beyond one run: a
   recipe that works, a region that's dead, a crash with a known cause, a
   metric that doesn't predict what you assumed.
-- Cite run ids or a reproducing SQL query as evidence.
+- Use the typed entry format at the top of `LESSONS.md` (kind, scope, claim,
+  evidence, action, status).
+- Cite run ids or a reproducing `run.py query` as evidence.
 - Never edit or delete past entries; append corrections instead.
 - Convert failures into information. A crash that changes your next
   experiment was a successful experiment.
@@ -209,14 +222,15 @@ Hard-won defaults, not rules — override them when you have a reason:
 A default shape, not a prescription — restructure it whenever evidence
 suggests a better way to spend the next experiment:
 
-1. **Query**: What has been tried? What's the frontier? Where are the gaps?
+1. **Brief**: `python run.py brief` — what has been tried, the fronts, the gaps.
 2. **Think**: What is the objective rewarding? Why did that config fail?
-   What does `LESSONS.md` say about this region?
-3. **Check**: Has this exact configuration been run before?
-4. **Run**: `python run.py --campaign {{CAMPAIGN_SLUG}} --solver ... [params]`
-5. **Evaluate**: Read the JSON output. Compare against the frontier.
-6. **Record**: If the result generalizes, append to `LESSONS.md`.
-7. **Repeat.**
+   Which lessons does the next experiment apply, test, or reject? Name them.
+3. **Run**: `python run.py --campaign {{CAMPAIGN_SLUG}} --solver ... [params]`
+   (exact repeats are refused automatically; `--replicate N` samples again).
+4. **Evaluate**: Read the JSON output — `on_front` says whether a passing run
+   joined its mode/target's Pareto front; a crash carries `crash_signature`.
+5. **Record**: If the result generalizes, append to `LESSONS.md`.
+6. **Repeat.**
 
 {{AUTONOMY_POLICY}}
 <!-- Pick one and delete the other:
