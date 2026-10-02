@@ -10,7 +10,9 @@ run it with `contract.run_solver` in the run directory with a timeout, parse its
 file, map native keys onto canonical metric keys, report what the run used
 (provenance) and what to keep (evidence), and classify the run — never raising
 for a solver failure. A pipeline adapter may expose several MODES and chain
-several run_solver calls in one run_experiment.
+several run_solver calls in one run_experiment. To reuse an expensive step
+across runs, give it its own mode that archives its output under
+`run.run_id`; the later mode loads it and sets `parent_run_id`.
 """
 
 from __future__ import annotations
@@ -30,7 +32,6 @@ NAME = "toy"
 MODES = ("optimize",)
 TARGET_FLAG = "problem"
 REQUIRED_ENV = ()
-OPTIONAL_ENV = ()
 EXECUTION_FLAGS = ("timeout",)
 SEED_FLAG = "seed"
 THREADS_FLAG = None

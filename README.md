@@ -307,7 +307,6 @@ templates/program_template.md   ← skeleton for a campaign's program.md
 templates/LESSONS.md            ← scaffold for a campaign's LESSONS.md
 campaigns/<name>/               ← one folder per campaign (created by /setup-harness)
 .claude/skills/setup-harness/   ← interactive first-time setup skill
-ROADMAP.md                      ← planned work
 ```
 
 ## Tests

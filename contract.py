@@ -22,7 +22,6 @@ An adapter is a module exposing:
     REQUIRED_ENV      tuple[str]   — env vars that must be set before a run; the
                                      core checks them and refuses to start
                                      without them.
-    OPTIONAL_ENV      tuple[str]   — env vars read when present (informational).
     EXECUTION_FLAGS   tuple[str]   — argparse dests that change how a run
                                      executes but not what it computes (timeout,
                                      thread count, solver location). Recorded,
@@ -127,8 +126,6 @@ class ExperimentOutcome:
         ran and judged, "error" when it was attempted but could not judge,
         None when it was not attempted. Put the measured quantity behind the
         verdict (e.g. a survival fraction) in `metrics`.
-    experiment_group: groups DB rows of one logical multi-step experiment;
-        None when one experiment is one row.
     provenance: what the run actually used, as JSON-able values — the exact
         solver command(s), solver commit, interpreter, hashes of input files.
     evidence: name → file under run.dir worth keeping whatever the artifact
@@ -143,7 +140,6 @@ class ExperimentOutcome:
     status_reason: str
     metrics: Mapping[str, object] = field(default_factory=dict)
     validated: str | None = None
-    experiment_group: str | None = None
     provenance: Mapping[str, object] = field(default_factory=dict)
     evidence: Mapping[str, Path] = field(default_factory=dict)
     parent_run_id: str | None = None

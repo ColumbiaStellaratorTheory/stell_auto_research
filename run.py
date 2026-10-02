@@ -59,7 +59,7 @@ from locks import acquire, acquire_slot, release, report_waiting, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # From this version on every DB row has a run file, so an older DB can be
 # rebuilt from runs/ without losing anything.
 FIRST_RECORD_BACKED_VERSION = 2
@@ -89,7 +89,7 @@ DEDUPE_STATUSES = ("pass", "fail")
 REPLAY_MISMATCH_EXIT = 2
 
 IDENTITY_COLUMNS = (
-    "id", "adapter", "mode", "target", "experiment_group",
+    "id", "adapter", "mode", "target",
     "spec_hash", "replicate", "seed", "parent_run_id", "replay_of", "batch_id",
     "status", "status_reason", "crash_signature", "validated", "elapsed", "peak_rss_mb", "created_at",
 )
@@ -481,23 +481,19 @@ def campaign_db_lock(layout: Layout):
             del _DB_LOCKS[key]
 
 
-def read_run_records(runs_dir: Path, active: ModuleType | None = None) -> list[dict]:
+def read_run_records(runs_dir: Path) -> list[dict]:
     """Every run record, upgraded to the current shape, ordered by (created_at, id)."""
-    records = [upgrade_record(json.loads(p.read_text()), active) for p in runs_dir.glob("*.json")]
+    records = [upgrade_record(json.loads(p.read_text())) for p in runs_dir.glob("*.json")]
     return sorted(records, key=lambda r: (r.get("created_at") or "", r["id"]))
 
 
-def upgrade_record(record: Mapping[str, object], active: ModuleType | None = None) -> dict:
-    """A run record in the current shape; records from before schema v6 are converted.
+def upgrade_record(record: Mapping[str, object]) -> dict:
+    """A run record in the current shape; records from the original harness are converted.
 
-    Old records named the adapter, mode and target `coil_type`, `solver` and
-    `equilibrium`, and kept some metrics as top-level fields. Their spec hash
-    was computed over the old param names, so when the record belongs to the
-    given adapter it is recomputed from the upgraded params and the recorded
-    solver identity (the original is kept as `legacy_spec_hash`); that keeps
-    old runs deduplicating against identical new ones. Records of another
-    adapter keep their hash and can never match. Run files are never rewritten;
-    they are converted whenever they are read.
+    Those records (e.g. an old results.jsonl) named the adapter, mode and
+    target `coil_type`, `solver` and `equilibrium`, and kept some metrics as
+    top-level fields. Run files are never rewritten; they are converted
+    whenever they are read.
     """
     if "coil_type" not in record:
         return dict(record)
@@ -511,13 +507,7 @@ def upgrade_record(record: Mapping[str, object], active: ModuleType | None = Non
         k: v for k, v in record.items()
         if k not in LEGACY_RENAMES and k not in LEGACY_METRIC_FIELDS and k not in ("metrics", "params")
     }
-    upgraded = {**rest, **renamed, "metrics": metrics, "params": params}
-    identity = (record.get("provenance") or {}).get("solver_identity")
-    same_adapter = active is not None and upgraded.get("adapter") == active.NAME
-    if same_adapter and record.get("spec_hash") and identity:
-        upgraded["legacy_spec_hash"] = record["spec_hash"]
-        upgraded["spec_hash"] = spec_hash(active, params, identity)
-    return upgraded
+    return {**rest, **renamed, "metrics": metrics, "params": params}
 
 
 def _db_row(record: Mapping[str, object]) -> dict:
@@ -615,19 +605,19 @@ def index_record(layout: Layout, active: ModuleType, record: Mapping[str, object
         print(f"WARNING: results.db not updated ({e}); run `python run.py rebuild`", file=sys.stderr)
 
 
-def _legacy_record(raw: dict, source: Path, active: ModuleType) -> dict:
+def _legacy_record(raw: dict, source: Path) -> dict:
     """A results.jsonl record in the current record shape, annotated with its source.
 
     Provenance and evidence the export carried are kept; the import only adds
     `imported_from`.
     """
-    record = upgrade_record(raw, active)
+    record = upgrade_record(raw)
     record["provenance"] = {**(record.get("provenance") or {}), "imported_from": str(source)}
     record["evidence"] = record.get("evidence") or {}
     return record
 
 
-def import_jsonl(layout: Layout, active: ModuleType, source: Path) -> int:
+def import_jsonl(layout: Layout, source: Path) -> int:
     """Write a run file for each record in `source` that has none yet; return the count."""
     imported = 0
     for line in source.read_text().splitlines():
@@ -636,7 +626,7 @@ def import_jsonl(layout: Layout, active: ModuleType, source: Path) -> int:
         raw = json.loads(line)
         if (layout.runs_dir / f"{raw['id']}.json").exists():
             continue
-        write_run_record(layout.runs_dir, _legacy_record(raw, source, active))
+        write_run_record(layout.runs_dir, _legacy_record(raw, source))
         imported += 1
     return imported
 
@@ -649,7 +639,7 @@ def rebuild(layout: Layout, active: ModuleType) -> int:
     any, is kept as results.db.bak-<timestamp>.
     """
     with campaign_db_lock(layout):
-        records = read_run_records(layout.runs_dir, active)
+        records = read_run_records(layout.runs_dir)
         tmp_db = layout.db_path.with_name(f"results.db.rebuild-{os.getpid()}")
         tmp_db.unlink(missing_ok=True)
         with contextlib.closing(sqlite3.connect(str(tmp_db))) as db:
@@ -694,7 +684,6 @@ def _build_record(
         "adapter": active.NAME,
         "mode": args.mode,
         "target": getattr(args, active.TARGET_FLAG),
-        "experiment_group": outcome.experiment_group,
         "spec_hash": digest,
         "replicate": args.replicate,
         "seed": getattr(args, active.SEED_FLAG) if active.SEED_FLAG else None,
@@ -930,7 +919,7 @@ def replay(
     path = layout.runs_dir / f"{run_id}.json"
     if not path.exists():
         raise HarnessError(f"no run record {path}")
-    original = upgrade_record(json.loads(path.read_text()), active)
+    original = upgrade_record(json.loads(path.read_text()))
     args = with_seed(active, args_from_params(parser, original["params"], original.get("replicate") or 0))
     slot = acquire_slot(slots.dir, slots.capacity, report_waiting(slots.capacity))
     try:
@@ -1485,7 +1474,7 @@ def _dispatch(command: str, argv: list[str]) -> int:
         p.add_argument("--from-jsonl", type=Path, help="first import records from an older results.jsonl")
         args = p.parse_args(argv)
         active = load_adapter(config.adapter)
-        imported = import_jsonl(layout, active, args.from_jsonl) if args.from_jsonl else 0
+        imported = import_jsonl(layout, args.from_jsonl) if args.from_jsonl else 0
         rows = rebuild(layout, active)
         print(json.dumps({"campaign": campaign_dir.name, "imported": imported, "rows": rows}))
         return 0

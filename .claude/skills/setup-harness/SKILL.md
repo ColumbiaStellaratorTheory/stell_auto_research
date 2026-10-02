@@ -150,13 +150,11 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   `KEEP_ARTIFACTS` (`none`/`pass`/`all` — whole run dirs; the adapter's evidence
   files are kept regardless), `ARTIFACTS_DIR`, and any solver-specific
   seed/intermediate store the adapter needs.
-- **Experiment granularity (multi-step pipelines only)**: ask whether one
-  experiment should be **one DB row** (simplest — one row per full pipeline run)
-  or **one row per sub-step** (more plumbing, but lets the agent reuse an
-  expensive intermediate — e.g. a solved first stage — across downstream scans).
-  Per-step uses the `experiment_group` column to tie a parameter set's rows back
-  together, plus an archival hook to thread the intermediate forward. Default to
-  one-row-per-chain unless they want the reuse.
+- **Reusing expensive intermediates (multi-step pipelines only)**: one run is
+  one full pipeline. If a costly first step (e.g. a solve) should be reused
+  across downstream scans, make it its own mode that archives its output under
+  its run id, and let the later mode pick it up and set `parent_run_id` (the
+  toy adapter's docstring describes the pattern).
 
 ## Phase 6 — Generate
 
@@ -165,7 +163,8 @@ freedom; physics findings belong in `LESSONS.md`, not here.
    - `NAME`, `MODES` (the `--mode` choices; a single-shot solver has one
      mode, a pipeline may expose several), `TARGET_FLAG` (the argparse dest of
      the flag naming the target configuration, e.g. `"case"`),
-     `REQUIRED_ENV` / `OPTIONAL_ENV`, `EXECUTION_FLAGS` (dests that change how
+     `REQUIRED_ENV` (env vars a run cannot start without; list optional ones
+     in the adapter's docstring), `EXECUTION_FLAGS` (dests that change how
      a run executes but not its result: timeout, threads, solver location),
      `THREADS_FLAG` (the dest of the solver's threads-per-run flag, or `None`
      for a single-threaded solver; drives how many runs fit on the machine),

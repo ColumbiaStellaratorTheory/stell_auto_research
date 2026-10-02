@@ -158,9 +158,7 @@ Query the `results` view: the `runs` columns plus one column per metric
 (`SELECT target, objective_J FROM results ...`). `runs` holds the same rows
 with metrics as JSON, plus `params` (every flag of the run;
 `json_extract(params, '$.key')`), `provenance` and `evidence`. `adapter` = the
-solver family; `target` = the value of the target flag (`--{{TARGET_FLAG}}`);
-`experiment_group` ties together rows of one multi-step experiment (NULL when
-one experiment is one row).
+solver family; `target` = the value of the target flag (`--{{TARGET_FLAG}}`).
 
 ### Query Notes
 

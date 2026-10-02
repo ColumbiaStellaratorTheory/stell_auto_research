@@ -336,8 +336,8 @@ class TestRebuild(_ScratchDirTest):
         layout = self._layout()
         legacy = self.root / "old.jsonl"
         legacy.write_text(json.dumps({**self._record("old1", "2025-01-01"), "spec_hash": None}) + "\n")
-        self.assertEqual(run.import_jsonl(layout, toy, legacy), 1)
-        self.assertEqual(run.import_jsonl(layout, toy, legacy), 0)
+        self.assertEqual(run.import_jsonl(layout, legacy), 1)
+        self.assertEqual(run.import_jsonl(layout, legacy), 0)
         record = json.loads((layout.runs_dir / "old1.json").read_text())
         self.assertEqual(record["provenance"], {"imported_from": str(legacy)})
 
@@ -930,34 +930,11 @@ class TestReviewFixes(_ScratchDirTest):
         exported = self._toy_record("e1", "2026-01-01", provenance={"solver_identity": "abc", "adapter": {"command": ["x"]}},
                                     evidence={"log": {"sha256": "f00", "bytes": 3}})
         export.write_text(json.dumps(exported) + "\n")
-        run.import_jsonl(layout, toy, export)
+        run.import_jsonl(layout, export)
         record = json.loads((layout.runs_dir / "e1.json").read_text())
         self.assertEqual(record["provenance"]["solver_identity"], "abc")
         self.assertEqual(record["provenance"]["imported_from"], str(export))
         self.assertEqual(record["evidence"], {"log": {"sha256": "f00", "bytes": 3}})
-
-    # 6 — an upgraded old run deduplicates against the identical new run
-    def test_upgraded_old_run_matches_the_new_spec_hash(self):
-        layout = self._layout()
-        args = run.with_seed(toy, _toy_args(problem="sphere", seed=5))
-        identity = toy.solver_identity(args)
-        new_hash = run.spec_hash(toy, run.run_spec(args), identity)
-        old_params = {("solver" if k == "mode" else k): v for k, v in run.run_spec(args).items()}
-        run.write_run_record(layout.runs_dir, {
-            "id": "old", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere", "status": "pass",
-            "status_reason": "ok", "created_at": "2026-01-01", "replicate": 0, "spec_hash": "pre-v6-hash",
-            "params": old_params, "provenance": {"solver_identity": identity},
-        })
-        run.write_run_record(layout.runs_dir, {
-            "id": "foreign", "coil_type": "other_adapter", "solver": "optimize", "equilibrium": "sphere",
-            "status": "pass", "status_reason": "ok", "created_at": "2026-01-02", "replicate": 0,
-            "spec_hash": "foreign-hash", "params": old_params, "provenance": {"solver_identity": identity},
-        })
-        run.rebuild(layout, toy)
-        self.assertEqual(run.find_duplicate(layout, toy, new_hash, 0)["id"], "old")
-        upgraded = {r["id"]: r for r in map(json.loads, layout.jsonl_path.read_text().splitlines())}
-        self.assertEqual(upgraded["old"]["legacy_spec_hash"], "pre-v6-hash")
-        self.assertEqual(upgraded["foreign"]["spec_hash"], "foreign-hash", "another adapter's run keeps its hash")
 
     # 7b — a spec running elsewhere is waited for, not dropped
     def test_in_progress_spec_is_retried_until_recorded(self):

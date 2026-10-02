@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS runs (
     adapter                 TEXT NOT NULL,   -- adapter NAME
     mode                    TEXT NOT NULL,   -- adapter mode (--mode)
     target                  TEXT NOT NULL,   -- value of the adapter's TARGET_FLAG
-    experiment_group        TEXT,            -- groups rows of one multi-step experiment; NULL = one row per experiment
     spec_hash               TEXT,            -- hash of what was asked (adapter, flags, solver identity); NULL for imported legacy rows
     replicate               INTEGER,         -- --replicate index; with spec_hash, the dedupe key
     seed                    INTEGER,         -- value of the adapter's SEED_FLAG (given or derived); NULL if the solver has none
@@ -36,7 +35,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_target   ON runs(mode, target);
-CREATE INDEX IF NOT EXISTS idx_runs_group    ON runs(experiment_group);
 CREATE INDEX IF NOT EXISTS idx_runs_spec     ON runs(spec_hash, replicate);
 CREATE INDEX IF NOT EXISTS idx_runs_parent   ON runs(parent_run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_batch    ON runs(batch_id);
