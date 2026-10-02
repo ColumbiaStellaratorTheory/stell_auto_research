@@ -16,7 +16,7 @@ The end state is these pieces, all verified by a real run:
 folder** `campaigns/<slug>/` holding `config.json` (which adapter + its
 settings), `program.md` (the agent's instructions) and `LESSONS.md` (research
 memory) + **run.py** (generic runner, untouched) + the campaign's
-**results.db/jsonl** (experiment DB, created by the first run).
+**results.db** (experiment DB, created by the first run).
 
 Run the phases in order. Be concrete, verify every step, and do not declare
 done on a red smoke run. The user may be new to autoresearch and skeptical that
@@ -26,14 +26,15 @@ honest; the value you deliver is a working runner + bookkeeping, not physics.
 ## Phase 1 — Preflight: learn the contract
 
 Read these before asking anything:
-1. `contract.py` — the harness↔adapter contract. This is the interface the
-   generated adapter must implement (its module docstring lists every member)
-   and the `RunContext` / `ExperimentOutcome` types it uses.
-2. `run.py` — the generic core: campaign selection (`--campaign`, one folder
-   per campaign under `campaigns/`), `config.json` (`adapter` + `env`), how it
-   calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
-   hash / dedupe / derived seeds / replay, the artifact layout (`OUTPUT_BASE` /
-   `KEEP_ARTIFACTS` / `ARTIFACTS_DIR`). Metrics are stored as JSON; the
+1. `contract.py` — the harness↔adapter contract. Its module docstring is the
+   one full description of the interface the generated adapter must implement,
+   including the `RunContext` / `ExperimentOutcome` types it uses.
+2. `README.md` — how the generic core works: campaign selection
+   (`--campaign`, one folder per campaign under `campaigns/`), `config.json`
+   (`adapter` + `env`), how it calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
+   hash / dedupe / derived seeds / replay, the artifact layout
+   (`AUTORESEARCH_SCRATCH_DIR` / `AUTORESEARCH_KEEP_ARTIFACTS` /
+   `AUTORESEARCH_ARTIFACTS_DIR`). Metrics are stored as JSON; the
    `results` view gives each of the adapter's `METRICS` a column. The core
    records every parsed flag.
    `adapters/__init__.py` is the registry of installed adapters.
@@ -118,7 +119,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   real physical/hardware limits.
 - **Constraint floors**: the buildability limits (offer the adapter's defaults
   as baseline).
-- **Hardware and run budget.** First run `python run.py machine` and show the
+- **Hardware and run budget.** First run `python run.py status` and show the
   user what it detected (OS, usable CPUs, performance cores on Apple Silicon,
   memory, GPUs, SLURM). Fill gaps with OS-native commands only when needed
   (Windows: PowerShell `Get-CimInstance Win32_ComputerSystem`; AMD:
@@ -132,7 +133,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      e.g. every 30 min / 2 h / overnight. Becomes `plan_minutes`.
   4. **Session budget?** hours or runs before the loop stops. Goes into the
      program file's autonomy policy.
-  If other campaigns already exist (`python run.py campaigns`), also ask
+  If other campaigns already exist (`python run.py status` lists them), also ask
   **how this campaign shares the machine** — becomes its `max_parallel` cap.
   Also ask the solver's threads per run and timeout per mode.
 - **Devices the solver can actually use.** Do not count a GPU because it
@@ -146,9 +147,10 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   GPU memory at its first operation. On Apple Silicon the GPU shares RAM
   with the CPU: one memory budget, not two.
 - **Autonomy**: "never stop" loop vs bounded sessions.
-- **Artifact layout**: `OUTPUT_BASE` (scratch, default `campaigns/<slug>/scratch`),
-  `KEEP_ARTIFACTS` (`none`/`pass`/`all` — whole run dirs; the adapter's evidence
-  files are kept regardless), `ARTIFACTS_DIR`, and any solver-specific
+- **Artifact layout**: `AUTORESEARCH_SCRATCH_DIR` (scratch, default
+  `campaigns/<slug>/scratch`), `AUTORESEARCH_KEEP_ARTIFACTS`
+  (`none`/`pass`/`all` — whole run dirs; the adapter's evidence files are
+  kept regardless), `AUTORESEARCH_ARTIFACTS_DIR`, and any solver-specific
   seed/intermediate store the adapter needs.
 - **Reusing expensive intermediates (multi-step pipelines only)**: one run is
   one full pipeline. If a costly first step (e.g. a solve) should be reused
@@ -158,47 +160,17 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 
 ## Phase 6 — Generate
 
-1. **Adapter** (`adapters/<solver-slug>.py`) — implement the `contract.py`
-   interface, modeling `adapters/toy.py`:
-   - `NAME`, `MODES` (the `--mode` choices; a single-shot solver has one
-     mode, a pipeline may expose several), `TARGET_FLAG` (the argparse dest of
-     the flag naming the target configuration, e.g. `"case"`),
-     `REQUIRED_ENV` (env vars a run cannot start without; list optional ones
-     in the adapter's docstring), `EXECUTION_FLAGS` (dests that change how
-     a run executes but not its result: timeout, threads, solver location),
-     `THREADS_FLAG` (the dest of the solver's threads-per-run flag, or `None`
-     for a single-threaded solver; drives how many runs fit on the machine),
-     `SEED_FLAG` (the solver's RNG seed flag dest with default `None`, or
-     `None` if the solver is deterministic), `REPLAY_TOLERANCE` (relative
-     per-metric tolerance for `run.py replay`; say in a comment whether it was
-     measured or is a starting value), `METRICS` (every canonical metric key
-     the adapter emits → `"min"`, `"max"` or `None`; the goals come from the
-     interview's evaluation answers and drive the Pareto front in
-     `run.py brief`).
-   - `add_arguments(parser)` — register the target flag (with a default) plus
-     every solver param the agent may set, with the solver's real defaults.
-     Only flags the solver actually supports. The core records every flag, so
-     there is no list of "kept" params to maintain.
-   - Launch every solver process with `contract.run_solver` (timeouts and
-     cancellation kill the whole process tree) and pass thread counts through
-     `contract.thread_env(n)` (sets OpenMP, OpenBLAS, MKL, BLIS, Accelerate,
-     Numba and NumExpr limits together).
-   - Name the solver's combined output `"log"` in `evidence`: the core reads
-     its tail to give crashes a `crash_signature`.
-   - `solver_identity(args)` — fingerprint of the solver code (commit + hash
-     of uncommitted changes via `contract.git_output`, or a file hash).
-   - `run_experiment(args, run)` — run one experiment end-to-end in `run.dir`
-     (one subprocess, or the full chain), parse outputs, map metrics →
-     canonical keys, classify pass/fail, run any validation, archive any
-     reusable intermediate under `run.run_id` (and set `parent_run_id` when a
-     run reuses one), and return an `ExperimentOutcome` with `provenance`
-     (exact command(s), input-file hashes) and `evidence` (log, results file,
-     solver patch). Must not raise on solver failure — return a `crash`/`fail`
-     outcome (the core catches truly-unexpected exceptions).
-   - Read env vars inside `run_experiment` / `solver_identity`, never at
-     import: every registered adapter is imported on every run.
+1. **Adapter** (`adapters/<solver-slug>.py`) — implement every member that
+   `contract.py`'s docstring describes, modeling `adapters/toy.py`. Checklist:
+   `NAME`, `MODES`, `TARGET_FLAG`, `REQUIRED_ENV`, `EXECUTION_FLAGS`,
+   `SEED_FLAG`, `THREADS_FLAG`, `REPLAY_TOLERANCE`, `METRICS`,
+   `add_arguments`, `solver_identity`, `run_experiment`. Fill them from
+   Phase 4 and the interview (`METRICS` goals come from the metric-goal
+   answers). In a comment, say whether `REPLAY_TOLERANCE` was measured or is a
+   starting value.
    - **Register it** in `adapters/__init__.py`: one import line and one
-     `REGISTRY` entry. Do **not** edit `adapter.py` or `run.py`.
+     `REGISTRY` entry. Do **not** edit `adapter.py`, `run.py` or any other
+     core module.
 2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...},
    "plan_minutes": P, "max_parallel": N}` from the interview: the adapter's
    `REGISTRY` key; in `env` the solver root, interpreter, config dir, device
@@ -206,7 +178,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
    artifact-layout values; `plan_minutes` from question 3; `max_parallel`
    only when the machine is shared between campaigns. Omit anything left at
    default. No shell exports are needed.
-3. **Machine settings** — `python run.py machine --usable-cores C
+3. **Machine settings** — `python run.py status --usable-cores C
    --usable-memory-gb M --max-parallel N` from question 2. Start
    `--max-parallel` at `usable cores ÷ threads per run`; Phase 7 refines it
    with measured memory. These are machine-wide (`~/.autoresearch/machine.json`),
@@ -214,8 +186,9 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 4. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
    `templates/program_template.md` from the interview + introspection:
    parameter table (only real flags), target-configuration table, artifact
-   layout, success metric, hard invariants, constraint floors, schema and
-   metric goals (`python run.py schema --campaign <slug>`), machine policy
+   layout, success metric, hard invariants, constraint floors, schema
+   (`python run.py query --campaign <slug> "PRAGMA table_info(results)"`) and
+   metric goals (the adapter's `METRICS`), machine policy
    (slots, planning interval, budget). Leave deferred
    sections as short "TODO — fill in as lessons accumulate" notes; do not invent
    physics. Remove all template HTML comments from the generated file.
@@ -237,7 +210,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 3. For a chained pipeline, run one reduced-resolution full parameter set to prove
    every step and the artifact hand-offs work end-to-end.
 4. **Size from measurement.** Run one realistic (not reduced) experiment per
-   mode, then `python run.py machine`: it shows each mode's median run time,
+   mode, then `python run.py status`: it shows each mode's median run time,
    peak memory and threads, how many runs fit at once, and the batch size per
    planning interval. If memory, not cores, is the limit, lower
    `--max-parallel` accordingly; show the user the numbers and confirm.

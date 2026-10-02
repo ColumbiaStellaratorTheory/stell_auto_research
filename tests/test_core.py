@@ -31,12 +31,14 @@ import unittest
 from pathlib import Path
 
 import adapter
-import analysis
 import batch
+import campaign
 import contract
 import locks
 import machine
+import records
 import run
+import runner
 from adapters import toy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _make_campaign(root: Path, name: str, config: dict) -> Path:
     campaign_dir = root / name
     campaign_dir.mkdir(parents=True)
-    (campaign_dir / run.CONFIG_NAME).write_text(json.dumps(config))
+    (campaign_dir / campaign.CONFIG_NAME).write_text(json.dumps(config))
     return campaign_dir
 
 
@@ -60,8 +62,8 @@ class _ScratchDirTest(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
 
-    def _layout(self, keep: str = "none") -> run.Layout:
-        return run.Layout(self.root, self.root / "scratch", self.root / "artifacts", keep)
+    def _layout(self, keep: str = "none") -> campaign.Layout:
+        return campaign.Layout(self.root, self.root / "scratch", self.root / "artifacts", keep)
 
 
 class TestResolveCampaign(_ScratchDirTest):
@@ -70,31 +72,31 @@ class TestResolveCampaign(_ScratchDirTest):
     def test_named_campaign_is_selected(self):
         _make_campaign(self.root, "a", {"adapter": "toy"})
         _make_campaign(self.root, "b", {"adapter": "toy"})
-        self.assertEqual(run.resolve_campaign("b", self.root), self.root / "b")
+        self.assertEqual(campaign.resolve_campaign("b", self.root), self.root / "b")
 
     def test_only_campaign_is_selected_when_unnamed(self):
         _make_campaign(self.root, "solo", {"adapter": "toy"})
-        self.assertEqual(run.resolve_campaign(None, self.root), self.root / "solo")
+        self.assertEqual(campaign.resolve_campaign(None, self.root), self.root / "solo")
 
     def test_unnamed_with_several_campaigns_refuses_and_lists_them(self):
         _make_campaign(self.root, "a", {"adapter": "toy"})
         _make_campaign(self.root, "b", {"adapter": "toy"})
-        with self.assertRaisesRegex(run.CampaignError, r"2 campaigns exist \(a, b\)"):
-            run.resolve_campaign(None, self.root)
+        with self.assertRaisesRegex(campaign.CampaignError, r"2 campaigns exist \(a, b\)"):
+            campaign.resolve_campaign(None, self.root)
 
     def test_no_campaign_points_to_setup(self):
-        with self.assertRaisesRegex(run.CampaignError, "setup-harness"):
-            run.resolve_campaign(None, self.root)
+        with self.assertRaisesRegex(campaign.CampaignError, "setup-harness"):
+            campaign.resolve_campaign(None, self.root)
 
     def test_unknown_name_lists_existing_campaigns(self):
         _make_campaign(self.root, "a", {"adapter": "toy"})
-        with self.assertRaisesRegex(run.CampaignError, "existing campaigns: a"):
-            run.resolve_campaign("missing", self.root)
+        with self.assertRaisesRegex(campaign.CampaignError, "existing campaigns: a"):
+            campaign.resolve_campaign("missing", self.root)
 
     def test_directory_without_config_is_not_a_campaign(self):
         (self.root / "notes").mkdir()
         _make_campaign(self.root, "real", {"adapter": "toy"})
-        self.assertEqual(run.list_campaigns(self.root), ["real"])
+        self.assertEqual(campaign.list_campaigns(self.root), ["real"])
 
 
 class TestLoadConfig(_ScratchDirTest):
@@ -102,25 +104,25 @@ class TestLoadConfig(_ScratchDirTest):
 
     def test_adapter_and_env_are_read(self):
         d = _make_campaign(self.root, "c", {"adapter": "toy", "env": {"SOLVER_ROOT": "/s"}})
-        config = run.load_config(d)
+        config = campaign.load_config(d)
         self.assertEqual((config.adapter, dict(config.env)), ("toy", {"SOLVER_ROOT": "/s"}))
 
     def test_missing_adapter_is_rejected(self):
         d = _make_campaign(self.root, "c", {"env": {}})
-        with self.assertRaisesRegex(run.CampaignError, '"adapter" must be a non-empty string'):
-            run.load_config(d)
+        with self.assertRaisesRegex(campaign.CampaignError, '"adapter" must be a non-empty string'):
+            campaign.load_config(d)
 
     def test_non_string_env_value_is_rejected(self):
         d = _make_campaign(self.root, "c", {"adapter": "toy", "env": {"THREADS": 4}})
-        with self.assertRaisesRegex(run.CampaignError, '"env" must map names to string values'):
-            run.load_config(d)
+        with self.assertRaisesRegex(campaign.CampaignError, '"env" must map names to string values'):
+            campaign.load_config(d)
 
     def test_malformed_json_is_rejected(self):
         d = self.root / "c"
         d.mkdir()
-        (d / run.CONFIG_NAME).write_text("{not json")
-        with self.assertRaisesRegex(run.CampaignError, "cannot read"):
-            run.load_config(d)
+        (d / campaign.CONFIG_NAME).write_text("{not json")
+        with self.assertRaisesRegex(campaign.CampaignError, "cannot read"):
+            campaign.load_config(d)
 
 
 class TestEnv(unittest.TestCase):
@@ -128,20 +130,20 @@ class TestEnv(unittest.TestCase):
 
     def test_shell_value_takes_precedence(self):
         environ = {"SOLVER_ROOT": "/from/shell"}
-        run.apply_env({"SOLVER_ROOT": "/from/config", "DATA_DIR": "/d"}, environ)
+        campaign.apply_env({"SOLVER_ROOT": "/from/config", "DATA_DIR": "/d"}, environ)
         self.assertEqual(environ, {"SOLVER_ROOT": "/from/shell", "DATA_DIR": "/d"})
 
     def test_missing_required_env_names_the_variables_and_config(self):
         needy = types.SimpleNamespace(NAME="needy", REQUIRED_ENV=("A", "B"))
-        with self.assertRaisesRegex(run.HarnessError, r"needs B: add to the \"env\" map in /c/config.json"):
-            run.check_required_env(needy, {"A": "1"}, Path("/c"))
+        with self.assertRaisesRegex(campaign.HarnessError, r"needs B: add to the \"env\" map in /c/config.json"):
+            campaign.check_required_env(needy, {"A": "1"}, Path("/c"))
 
 
 class TestResolveLayout(unittest.TestCase):
     """Everything a campaign produces lives inside its own directory by default."""
 
     def test_defaults_are_inside_the_campaign(self):
-        layout = run.resolve_layout(Path("/c/demo"), {})
+        layout = campaign.resolve_layout(Path("/c/demo"), {})
         self.assertEqual(
             (layout.runs_dir, layout.blobs_dir, layout.scratch_dir, layout.artifacts_dir, layout.db_path),
             (Path("/c/demo/runs"), Path("/c/demo/blobs"), Path("/c/demo/scratch"),
@@ -149,8 +151,9 @@ class TestResolveLayout(unittest.TestCase):
         )
 
     def test_env_overrides_scratch_and_artifacts(self):
-        layout = run.resolve_layout(
-            Path("/c/demo"), {"OUTPUT_BASE": "/scratch", "ARTIFACTS_DIR": "/keep", "KEEP_ARTIFACTS": "pass"}
+        layout = campaign.resolve_layout(
+            Path("/c/demo"),
+            {campaign.SCRATCH_DIR_ENV: "/scratch", campaign.ARTIFACTS_DIR_ENV: "/keep", campaign.KEEP_ARTIFACTS_ENV: "pass"},
         )
         self.assertEqual(
             (layout.scratch_dir, layout.artifacts_dir, layout.keep_artifacts),
@@ -158,7 +161,7 @@ class TestResolveLayout(unittest.TestCase):
         )
 
     def test_invalid_keep_artifacts_falls_back_to_none(self):
-        self.assertEqual(run.resolve_layout(Path("/c"), {"KEEP_ARTIFACTS": "bogus"}).keep_artifacts, "none")
+        self.assertEqual(campaign.resolve_layout(Path("/c"), {campaign.KEEP_ARTIFACTS_ENV: "bogus"}).keep_artifacts, "none")
 
 
 class TestLoadAdapter(unittest.TestCase):
@@ -186,53 +189,53 @@ class TestRunSpec(unittest.TestCase):
     """The spec hash identifies what was asked; the derived seed makes runs reproducible."""
 
     def test_spec_holds_every_flag_except_core_flags(self):
-        spec = run.run_spec(_toy_args(dim=4))
+        spec = runner.run_spec(_toy_args(dim=4))
         self.assertNotIn("campaign", spec)
         self.assertNotIn("replicate", spec)
         self.assertEqual((spec["dim"], spec["mode"], spec["timeout"]), (4, "optimize", 60))
 
     def test_execution_flags_do_not_change_the_hash(self):
-        a = run.spec_hash(toy, run.run_spec(_toy_args(timeout=60)), "v1")
-        b = run.spec_hash(toy, run.run_spec(_toy_args(timeout=999)), "v1")
+        a = runner.spec_hash(toy, runner.run_spec(_toy_args(timeout=60)), "v1")
+        b = runner.spec_hash(toy, runner.run_spec(_toy_args(timeout=999)), "v1")
         self.assertEqual(a, b)
 
     def test_any_semantic_flag_changes_the_hash(self):
-        a = run.spec_hash(toy, run.run_spec(_toy_args(step_size=0.1)), "v1")
-        b = run.spec_hash(toy, run.run_spec(_toy_args(step_size=0.2)), "v1")
+        a = runner.spec_hash(toy, runner.run_spec(_toy_args(step_size=0.1)), "v1")
+        b = runner.spec_hash(toy, runner.run_spec(_toy_args(step_size=0.2)), "v1")
         self.assertNotEqual(a, b)
 
     def test_a_changed_solver_changes_the_hash(self):
-        spec = run.run_spec(_toy_args())
-        self.assertNotEqual(run.spec_hash(toy, spec, "v1"), run.spec_hash(toy, spec, "v2"))
+        spec = runner.run_spec(_toy_args())
+        self.assertNotEqual(runner.spec_hash(toy, spec, "v1"), runner.spec_hash(toy, spec, "v2"))
 
     def test_derived_seed_is_stable_and_differs_per_replicate(self):
-        spec = run.run_spec(_toy_args())
-        self.assertEqual(run.derive_seed(toy, spec, 0), run.derive_seed(toy, spec, 0))
-        self.assertNotEqual(run.derive_seed(toy, spec, 0), run.derive_seed(toy, spec, 1))
+        spec = runner.run_spec(_toy_args())
+        self.assertEqual(runner.derive_seed(toy, spec, 0), runner.derive_seed(toy, spec, 0))
+        self.assertNotEqual(runner.derive_seed(toy, spec, 0), runner.derive_seed(toy, spec, 1))
 
     def test_derived_seed_ignores_execution_flags(self):
-        a = run.derive_seed(toy, run.run_spec(_toy_args(timeout=5)), 0)
-        b = run.derive_seed(toy, run.run_spec(_toy_args(timeout=50)), 0)
+        a = runner.derive_seed(toy, runner.run_spec(_toy_args(timeout=5)), 0)
+        b = runner.derive_seed(toy, runner.run_spec(_toy_args(timeout=50)), 0)
         self.assertEqual(a, b)
 
     def test_explicit_seed_is_kept(self):
-        self.assertEqual(run.with_seed(toy, _toy_args(seed=42)).seed, 42)
+        self.assertEqual(runner.with_seed(toy, _toy_args(seed=42)).seed, 42)
 
     def test_unset_seed_is_filled_with_the_derived_seed(self):
         args = _toy_args(replicate=3)
-        self.assertEqual(run.with_seed(toy, args).seed, run.derive_seed(toy, run.run_spec(args), 3))
+        self.assertEqual(runner.with_seed(toy, args).seed, runner.derive_seed(toy, runner.run_spec(args), 3))
 
     def test_seedless_adapter_is_left_alone(self):
         seedless = types.SimpleNamespace(SEED_FLAG=None)
         args = _toy_args()
-        self.assertIs(run.with_seed(seedless, args), args)
+        self.assertIs(runner.with_seed(seedless, args), args)
 
 
 class TestBuildRecord(unittest.TestCase):
     """A record carries identity, spec, metrics, provenance, and evidence."""
 
     def _record(self, outcome: contract.ExperimentOutcome, **arg_overrides) -> dict:
-        return run._build_record(
+        return runner._build_record(
             toy, _toy_args(problem="rastrigin", seed=7, **arg_overrides), outcome, 0.0,
             run_id="r1", digest="h1", solver_identity="v1", evidence={"log": {"sha256": "x", "bytes": 1}},
         )
@@ -267,16 +270,16 @@ class TestBuildRecord(unittest.TestCase):
 
     def test_summary_is_compact(self):
         record = self._record(contract.ExperimentOutcome("pass", "ok", metrics={"objective_J": 0.5}))
-        printed = run.summary(record, on_front=True)
+        printed = runner.summary(record, on_front=True)
         self.assertFalse({"provenance", "evidence", "params", "spec_hash"} & set(printed))
         self.assertEqual((printed["metrics"], printed["on_front"]), ({"objective_J": 0.5}, True))
 
     def test_summary_carries_crash_signature_and_omits_on_front_for_non_pass(self):
-        record = run._build_record(
+        record = runner._build_record(
             toy, _toy_args(seed=1), contract.ExperimentOutcome("crash", "exit_1"), 0.0,
             run_id="r", digest="h", solver_identity="v", evidence={}, crash_signature="ValueError: bad",
         )
-        printed = run.summary(record, on_front=None)
+        printed = runner.summary(record, on_front=None)
         self.assertEqual(printed["crash_signature"], "ValueError: bad")
         self.assertNotIn("on_front", printed)
 
@@ -287,24 +290,24 @@ class TestEvidenceAndRecords(_ScratchDirTest):
     def test_evidence_is_content_addressed_and_shared(self):
         a, b = self.root / "a.log", self.root / "b.log"
         a.write_text("same"), b.write_text("same")
-        stored = run.store_evidence(self.root / "blobs", {"first": a, "second": b, "gone": self.root / "nope"})
+        stored = records.store_evidence(self.root / "blobs", {"first": a, "second": b, "gone": self.root / "nope"})
         self.assertEqual(set(stored), {"first", "second"}, "a missing file is skipped")
         self.assertEqual(stored["first"], stored["second"])
         digest = stored["first"]["sha256"]
         self.assertEqual((self.root / "blobs" / digest[:2] / digest).read_text(), "same")
 
     def test_run_record_write_leaves_no_temp_files(self):
-        run.write_run_record(self.root / "runs", {"id": "r1", "status": "pass"})
+        records.write_run_record(self.root / "runs", {"id": "r1", "status": "pass"})
         self.assertEqual([p.name for p in (self.root / "runs").iterdir()], ["r1.json"])
 
     def test_records_read_in_creation_order(self):
         for rid, created in (("b", "2026-01-02"), ("a", "2026-01-03"), ("c", "2026-01-01")):
-            run.write_run_record(self.root / "runs", {"id": rid, "created_at": created})
-        self.assertEqual([r["id"] for r in run.read_run_records(self.root / "runs")], ["c", "b", "a"])
+            records.write_run_record(self.root / "runs", {"id": rid, "created_at": created})
+        self.assertEqual([r["id"] for r in records.read_run_records(self.root / "runs")], ["c", "b", "a"])
 
 
 class TestRebuild(_ScratchDirTest):
-    """results.db and results.jsonl are regenerated from the run files."""
+    """results.db is regenerated from the run files."""
 
     def _record(self, rid: str, created: str) -> dict:
         return {
@@ -314,39 +317,28 @@ class TestRebuild(_ScratchDirTest):
             "params": {"dim": 2}, "metrics": {"objective_J": 1.5}, "provenance": {}, "evidence": {},
         }
 
-    def test_rebuild_indexes_every_run_and_writes_jsonl(self):
+    def test_rebuild_indexes_every_run(self):
         layout = self._layout()
         for rid, created in (("r2", "2026-01-02"), ("r1", "2026-01-01")):
-            run.write_run_record(layout.runs_dir, self._record(rid, created))
-        self.assertEqual(run.rebuild(layout, toy), 2)
+            records.write_run_record(layout.runs_dir, self._record(rid, created))
+        self.assertEqual(records.rebuild(layout, toy), 2)
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             rows = db.execute("SELECT id, json_extract(metrics, '$.objective_J') FROM runs ORDER BY id").fetchall()
         self.assertEqual(rows, [("r1", 1.5), ("r2", 1.5)])
-        jsonl_ids = [json.loads(line)["id"] for line in layout.jsonl_path.read_text().splitlines()]
-        self.assertEqual(jsonl_ids, ["r1", "r2"])
 
     def test_rebuild_keeps_a_backup_of_the_old_db(self):
         layout = self._layout()
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
-        run.rebuild(layout, toy)
+        records.rebuild(layout, toy)
         self.assertEqual(len(list(self.root.glob("results.db.bak-*"))), 1)
-
-    def test_legacy_jsonl_import_is_idempotent(self):
-        layout = self._layout()
-        legacy = self.root / "old.jsonl"
-        legacy.write_text(json.dumps({**self._record("old1", "2025-01-01"), "spec_hash": None}) + "\n")
-        self.assertEqual(run.import_jsonl(layout, legacy), 1)
-        self.assertEqual(run.import_jsonl(layout, legacy), 0)
-        record = json.loads((layout.runs_dir / "old1.json").read_text())
-        self.assertEqual(record["provenance"], {"imported_from": str(legacy)})
 
     def test_outdated_db_is_refused_with_rebuild_instructions(self):
         layout = self._layout()
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
-        with self.assertRaisesRegex(run.HarnessError, "schema version 0.*python run.py rebuild"):
-            run.open_db(layout, toy)
+        with self.assertRaisesRegex(campaign.HarnessError, "schema version 0.*python run.py rebuild"):
+            records.open_db(layout, toy)
 
 
 class TestCompareRuns(unittest.TestCase):
@@ -356,17 +348,17 @@ class TestCompareRuns(unittest.TestCase):
         return {"status": status, "metrics": {"objective_J": metrics.pop("objective_J", 1.0), **metrics}}
 
     def test_identical_runs_match(self):
-        self.assertEqual(run.compare_runs(self._rec(final_step=0.5), self._rec(final_step=0.5), 0.0), [])
+        self.assertEqual(runner.compare_runs(self._rec(final_step=0.5), self._rec(final_step=0.5), 0.0), [])
 
     def test_difference_within_tolerance_matches(self):
-        self.assertEqual(run.compare_runs(self._rec(objective_J=1.0), self._rec(objective_J=1.0 + 1e-9), 1e-6), [])
+        self.assertEqual(runner.compare_runs(self._rec(objective_J=1.0), self._rec(objective_J=1.0 + 1e-9), 1e-6), [])
 
     def test_difference_beyond_tolerance_is_reported(self):
-        mismatches = run.compare_runs(self._rec(objective_J=1.0), self._rec(objective_J=1.1), 1e-6)
+        mismatches = runner.compare_runs(self._rec(objective_J=1.0), self._rec(objective_J=1.1), 1e-6)
         self.assertEqual(mismatches, [{"field": "objective_J", "original": 1.0, "replay": 1.1}])
 
     def test_status_change_and_missing_metric_are_reported(self):
-        mismatches = run.compare_runs(self._rec(final_step=0.5), self._rec(status="fail"), 1e-6)
+        mismatches = runner.compare_runs(self._rec(final_step=0.5), self._rec(status="fail"), 1e-6)
         self.assertEqual([m["field"] for m in mismatches], ["status", "final_step"])
 
 
@@ -379,7 +371,7 @@ class TestExecute(_ScratchDirTest):
             run_experiment=lambda _a, _r: 1 / 0,
         )
         args = argparse.Namespace(campaign="c", replicate=0, mode="optimize", problem="sphere", dim=3)
-        record = run.execute(broken, self._layout(), args, "v0")
+        record = runner.execute(broken, self._layout(), args, "v0")
         self.assertEqual(record["status"], "crash")
         self.assertTrue(record["status_reason"].startswith("adapter_error"), record["status_reason"])
         self.assertEqual(record["params"], {"mode": "optimize", "problem": "sphere", "dim": 3})
@@ -389,14 +381,14 @@ class TestExecute(_ScratchDirTest):
         src = self.root / "scratch" / "run_1"
         src.mkdir(parents=True)
         (src / "results.json").write_text("{}")
-        run._finalize_run_dir(self._layout("pass"), src, "pass", "id-pass-1")
+        runner._finalize_run_dir(self._layout("pass"), src, "pass", "id-pass-1")
         self.assertTrue((self.root / "artifacts" / "id-pass-1" / "results.json").exists())
         self.assertFalse(src.exists(), "run dir should be moved, not copied")
 
     def test_none_policy_discards_run_dir(self):
         src = self.root / "scratch" / "run_2"
         src.mkdir(parents=True)
-        run._finalize_run_dir(self._layout("none"), src, "pass", "id-pass-2")
+        runner._finalize_run_dir(self._layout("none"), src, "pass", "id-pass-2")
         self.assertFalse(src.exists())
         self.assertFalse((self.root / "artifacts").exists(), "no artifacts dir under 'none'")
 
@@ -412,12 +404,12 @@ class _CliTest(_ScratchDirTest):
     def _run(self, *flags: str) -> subprocess.CompletedProcess:
         env = {
             **os.environ,
-            run.CAMPAIGNS_DIR_ENV: str(self.campaigns),
-            run.SLOTS_DIR_ENV: str(self.root / "slots"),
-            run.MAX_PARALLEL_ENV: "4",
-            run.MACHINE_DIR_ENV: str(self.root / "machine"),
+            campaign.CAMPAIGNS_DIR_ENV: str(self.campaigns),
+            campaign.MAX_PARALLEL_ENV: "4",
+            campaign.MACHINE_DIR_ENV: str(self.root / "machine"),
         }
-        for inherited in (run.CAMPAIGN_ENV, "KEEP_ARTIFACTS", "ARTIFACTS_DIR", "OUTPUT_BASE", run.BLOBS_DIR_ENV):
+        for inherited in (campaign.CAMPAIGN_ENV, campaign.KEEP_ARTIFACTS_ENV, campaign.ARTIFACTS_DIR_ENV,
+                          campaign.SCRATCH_DIR_ENV):
             env.pop(inherited, None)
         return subprocess.run(
             [sys.executable, str(REPO_ROOT / "run.py"), *flags],
@@ -508,7 +500,7 @@ class TestEndToEnd(_CliTest):
         self.assertEqual((len(self._run_files(other)), len(self._run_files())), (1, 0))
 
     def test_config_env_is_applied_before_the_run(self):
-        kept = _make_campaign(self.campaigns, "keeper", {"adapter": "toy", "env": {"KEEP_ARTIFACTS": "all"}})
+        kept = _make_campaign(self.campaigns, "keeper", {"adapter": "toy", "env": {campaign.KEEP_ARTIFACTS_ENV: "all"}})
         run_id = self._json("--campaign", "keeper", "--problem", "sphere", "--maxiter", "50")["id"]
         self.assertTrue((kept / "artifacts" / run_id / "results.json").exists())
 
@@ -518,16 +510,16 @@ class TestEndToEnd(_CliTest):
         needy.NAME, needy.REQUIRED_ENV = "needy", ("NEEDY_SOLVER_ROOT",)
         self.addCleanup(adapter.REGISTRY.pop, "needy", None)
         adapter.REGISTRY["needy"] = needy
-        campaign = _make_campaign(self.campaigns, "needy", {"adapter": "needy"})
-        environ = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine")}
+        needy_dir = _make_campaign(self.campaigns, "needy", {"adapter": "needy"})
+        environ = {**os.environ, campaign.CAMPAIGNS_DIR_ENV: str(self.campaigns), campaign.MACHINE_DIR_ENV: str(self.root / "machine")}
         environ.pop("NEEDY_SOLVER_ROOT", None)
         original = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
         os.environ.clear()
         os.environ.update(environ)
-        with self.assertRaisesRegex(run.HarnessError, "needs NEEDY_SOLVER_ROOT"):
+        with self.assertRaisesRegex(campaign.HarnessError, "needs NEEDY_SOLVER_ROOT"):
             run._dispatch("run", ["--campaign", "needy"])
-        self.assertFalse((campaign / "runs").exists())
+        self.assertFalse((needy_dir / "runs").exists())
 
     def test_unknown_adapter_exits_with_message(self):
         _make_campaign(self.campaigns, "broken", {"adapter": "nope"})
@@ -542,19 +534,19 @@ class TestSchemaUpgrade(_ScratchDirTest):
 
     def test_v2_db_is_rebuilt_on_open(self):
         layout = self._layout()
-        run.write_run_record(layout.runs_dir, {
-            "id": "r1", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
+        records.write_run_record(layout.runs_dir, {
+            "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere",
             "status": "crash", "status_reason": "exit_1", "created_at": "2026-01-01",
         })
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
             db.execute("PRAGMA user_version = 2")
-        with contextlib.closing(run.open_db(layout, toy)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
+        with contextlib.closing(records.open_db(layout, toy)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], records.SCHEMA_VERSION)
             self.assertEqual(
                 db.execute("SELECT id, adapter, mode, target FROM runs").fetchall(),
                 [("r1", "toy", "optimize", "sphere")],
-                "old run files are converted to the current names on rebuild",
+                "the run files are re-indexed under the current schema",
             )
 
 
@@ -562,10 +554,10 @@ class TestSpecBase(unittest.TestCase):
     """Replicates of one spec share a spec_base whatever their seeds."""
 
     def test_seed_and_execution_flags_do_not_change_it(self):
-        a = run.spec_base(toy, run.run_spec(_toy_args(seed=1, timeout=5)))
-        b = run.spec_base(toy, run.run_spec(_toy_args(seed=2, timeout=50)))
+        a = runner.spec_base(toy, runner.run_spec(_toy_args(seed=1, timeout=5)))
+        b = runner.spec_base(toy, runner.run_spec(_toy_args(seed=2, timeout=50)))
         self.assertEqual(a, b)
-        self.assertNotEqual(a, run.spec_base(toy, run.run_spec(_toy_args(dim=9))))
+        self.assertNotEqual(a, runner.spec_base(toy, runner.run_spec(_toy_args(dim=9))))
 
 
 class TestLoaderMetrics(unittest.TestCase):
@@ -578,60 +570,51 @@ class TestLoaderMetrics(unittest.TestCase):
             adapter.load_adapter("bad", {"bad": bad})
 
 
-class TestQueryAndLessons(_ScratchDirTest):
-    """query is read-only and capped; lessons import as marked priors."""
+class TestQuery(_ScratchDirTest):
+    """query is read-only and capped."""
 
-    def _layout_with_runs(self, n: int) -> run.Layout:
+    def _layout_with_runs(self, n: int) -> campaign.Layout:
         layout = self._layout()
         for i in range(n):
-            run.write_run_record(layout.runs_dir, {
+            records.write_run_record(layout.runs_dir, {
                 "id": f"r{i}", "adapter": "toy", "mode": "optimize", "target": "sphere",
                 "status": "pass", "status_reason": "ok", "created_at": f"2026-01-{i + 1:02d}",
                 "metrics": {"objective_J": float(i)},
             })
-        run.rebuild(layout, toy)
+        records.rebuild(layout, toy)
         return layout
 
     def test_query_returns_header_and_rows(self):
-        out = run.query(self._layout_with_runs(2), toy, "SELECT id, objective_J FROM results ORDER BY id", 10)
+        out = records.query(self._layout_with_runs(2), toy, "SELECT id, objective_J FROM results ORDER BY id", 10)
         self.assertEqual(out.splitlines(), ["id\tobjective_J", "r0\t0", "r1\t1"])
 
     def test_query_is_capped(self):
-        out = run.query(self._layout_with_runs(5), toy, "SELECT id FROM runs", 2)
+        out = records.query(self._layout_with_runs(5), toy, "SELECT id FROM runs", 2)
         self.assertEqual(len(out.splitlines()), 4)
         self.assertIn("more than 2 rows", out)
 
     def test_query_cannot_write(self):
         layout = self._layout_with_runs(1)
-        with self.assertRaisesRegex(run.HarnessError, "readonly"):
-            run.query(layout, toy, "DELETE FROM runs", 10)
-
-    def test_import_lessons_demotes_headings_under_one_marked_entry(self):
-        source, target = self.root / "src", self.root / "dst"
-        source.mkdir(), target.mkdir()
-        (source / run.LESSONS_NAME).write_text("# L\n\n## 2026-01-01 — use restarts\n- kind: recipe\n")
-        (target / run.LESSONS_NAME).write_text("# L\n")
-        self.assertEqual(run.import_lessons(source, target), 1)
-        text = (target / run.LESSONS_NAME).read_text()
-        self.assertIn("### 2026-01-01 — use restarts", text)
-        self.assertEqual(len(analysis.lesson_titles(text)), 1, "imported entries are not this campaign's own")
-        self.assertIn("Imported 1 lessons from campaign src", analysis.lesson_titles(text)[0])
+        with self.assertRaisesRegex(campaign.HarnessError, "readonly"):
+            records.query(layout, toy, "DELETE FROM runs", 10)
 
 
 class TestCommandsEndToEnd(_CliTest):
-    """brief, query, campaigns and crash signatures through the real CLI."""
+    """brief, query, status and crash signatures through the real CLI."""
 
     def test_crash_carries_its_signature(self):
         self.assertEqual(self._json("--inject", "crash")["crash_signature"], "injected crash")
 
-    def test_brief_query_and_campaigns(self):
+    def test_brief_query_and_status(self):
         self._json("--problem", "sphere", "--maxiter", "50")
         brief = self._run("brief")
         self.assertIn("campaign demo · adapter toy · 1 runs: 1 pass", brief.stdout, brief.stderr)
         rows = self._run("query", "SELECT status, COUNT(*) FROM runs GROUP BY status").stdout.splitlines()
         self.assertEqual(rows, ["status\tCOUNT(*)", "pass\t1"])
-        table = self._run("campaigns").stdout.splitlines()
-        self.assertEqual(table[1].split("\t")[:4], ["demo", "toy", "1", "1"])
+        status = self._run("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("campaign demo · adapter toy\n  1 runs: 1 pass, 0 fail, 0 crash · last ", status.stdout)
+        self.assertIn("0 runs since the front moved", status.stdout)
 
 
 
@@ -656,48 +639,44 @@ class TestLocksAndSlots(_ScratchDirTest):
         locks.release(first), locks.release(second)
 
     def test_slot_capacity_comes_from_the_environment(self):
-        slots = run.resolve_slots({run.MAX_PARALLEL_ENV: "3", run.SLOTS_DIR_ENV: "/s", run.MACHINE_DIR_ENV: str(self.root)})
-        self.assertEqual((slots.dir, slots.capacity), (Path("/s"), 3))
-        with self.assertRaisesRegex(run.HarnessError, "must be an integer >= 1"):
-            run.resolve_slots({run.MAX_PARALLEL_ENV: "0", run.MACHINE_DIR_ENV: str(self.root)})
+        slots = campaign.resolve_slots({campaign.MAX_PARALLEL_ENV: "3", campaign.MACHINE_DIR_ENV: str(self.root)})
+        self.assertEqual((slots.dir, slots.capacity), (self.root / "slots", 3))
+        with self.assertRaisesRegex(campaign.HarnessError, "must be an integer >= 1"):
+            campaign.resolve_slots({campaign.MAX_PARALLEL_ENV: "0", campaign.MACHINE_DIR_ENV: str(self.root)})
 
     def test_machine_json_sets_capacity_and_env_overrides_it(self):
         machine.write_settings(self.root, {"max_parallel": 5})
-        environ = {run.MACHINE_DIR_ENV: str(self.root)}
-        self.assertEqual(run.resolve_slots(environ).capacity, 5)
-        self.assertEqual(run.resolve_slots({**environ, run.MAX_PARALLEL_ENV: "2"}).capacity, 2)
-        self.assertEqual(run.resolve_slots(environ).dir, self.root / "slots")
-        self.assertEqual(run.resolve_slots({run.MACHINE_DIR_ENV: str(self.root / "empty")}).capacity, 1)
+        environ = {campaign.MACHINE_DIR_ENV: str(self.root)}
+        self.assertEqual(campaign.resolve_slots(environ).capacity, 5)
+        self.assertEqual(campaign.resolve_slots({**environ, campaign.MAX_PARALLEL_ENV: "2"}).capacity, 2)
+        self.assertEqual(campaign.resolve_slots(environ).dir, self.root / "slots")
+        self.assertEqual(campaign.resolve_slots({campaign.MACHINE_DIR_ENV: str(self.root / "empty")}).capacity, 1)
 
     def test_busy_slots_counts_held_locks(self):
-        slots = run.Slots(self.root / "slots", 3)
+        slots = campaign.Slots(self.root / "slots", 3)
         held = locks.acquire_slot(slots.dir, slots.capacity)
         self.addCleanup(locks.release, held)
-        self.assertEqual(run.busy_slots(slots), 1)
+        self.assertEqual(campaign.busy_slots(slots), 1)
 
     def test_plan_minutes_is_validated(self):
         d = _make_campaign(self.root, "c", {"adapter": "toy", "plan_minutes": 0})
-        with self.assertRaisesRegex(run.CampaignError, "plan_minutes"):
-            run.load_config(d)
+        with self.assertRaisesRegex(campaign.CampaignError, "plan_minutes"):
+            campaign.load_config(d)
 
     def test_campaign_max_parallel_is_validated(self):
         d = _make_campaign(self.root, "c", {"adapter": "toy", "max_parallel": 0})
-        with self.assertRaisesRegex(run.CampaignError, "max_parallel"):
-            run.load_config(d)
+        with self.assertRaisesRegex(campaign.CampaignError, "max_parallel"):
+            campaign.load_config(d)
 
     def test_claimed_spec_is_reported_in_progress(self):
         layout = self._layout()
-        args = run.with_seed(toy, _toy_args(problem="sphere"))
-        digest = run.spec_hash(toy, run.run_spec(args), toy.solver_identity(args))
+        args = runner.with_seed(toy, _toy_args(problem="sphere"))
+        digest = runner.spec_hash(toy, runner.run_spec(args), toy.solver_identity(args))
         claim = locks.try_lock(layout.claims_dir / f"{digest}-0.lock")
         self.addCleanup(locks.release, claim)
-        printed = run.run_once(toy, layout, run.Slots(self.root / "slots", 1), args)
+        printed = runner.run_once(toy, layout, campaign.Slots(self.root / "slots", 1), args)
         self.assertEqual(printed, {"in_progress": True, "spec_hash": digest, "replicate": 0})
         self.assertFalse(layout.runs_dir.exists(), "nothing ran")
-
-    def test_shared_blob_store_from_environment(self):
-        layout = run.resolve_layout(Path("/c/demo"), {run.BLOBS_DIR_ENV: "/machine/blobs"})
-        self.assertEqual(layout.blobs_dir, Path("/machine/blobs"))
 
 
 class TestBatchEndToEnd(_CliTest):
@@ -765,9 +744,9 @@ class TestBatchEndToEnd(_CliTest):
 
     @unittest.skipIf(os.name == "nt", "SIGTERM delivery is POSIX-only")
     def test_sigterm_records_a_cancelled_run(self):
-        env = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns),
-               run.SLOTS_DIR_ENV: str(self.root / "slots"), run.MAX_PARALLEL_ENV: "4"}
-        env.pop(run.CAMPAIGN_ENV, None)
+        env = {**os.environ, campaign.CAMPAIGNS_DIR_ENV: str(self.campaigns),
+               campaign.MACHINE_DIR_ENV: str(self.root / "machine"), campaign.MAX_PARALLEL_ENV: "4"}
+        env.pop(campaign.CAMPAIGN_ENV, None)
         proc = subprocess.Popen(
             [sys.executable, str(REPO_ROOT / "run.py"), "--inject", "hang", "--timeout", "600"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=REPO_ROOT,
@@ -783,26 +762,28 @@ class TestBatchEndToEnd(_CliTest):
 
 
 class TestMachineEndToEnd(_CliTest):
-    """machine and schema commands, peak memory, and sizing in the brief."""
+    """status, the results columns, peak memory, and sizing in the brief."""
 
-    def test_machine_saves_settings_and_reports_campaign_cost(self):
+    def test_status_saves_settings_and_reports_campaign_cost(self):
         self._json("--problem", "sphere", "--maxiter", "100")
-        proc = self._run("machine", "--max-parallel", "3", "--usable-cores", "12")
+        proc = self._run("status", "--max-parallel", "3", "--usable-cores", "12")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(machine.read_settings(self.root / "machine"), {"max_parallel": 3, "usable_cores": 12})
         self.assertIn("usable_cpus:", proc.stdout)
-        self.assertIn("campaign demo:", proc.stdout)
+        self.assertIn("campaign demo · adapter toy", proc.stdout)
         self.assertIn("optimize: 1 runs", proc.stdout)
 
     def test_invalid_machine_setting_is_refused(self):
-        proc = self._run("machine", "--max-parallel", "0")
+        proc = self._run("status", "--max-parallel", "0")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("must be > 0", proc.stderr)
 
-    def test_schema_lists_columns_and_goals(self):
-        out = self._run("schema").stdout
-        self.assertIn("peak_rss_mb", out)
-        self.assertIn("goals: objective_J↓  distance_to_optimum↓", out)
+    def test_pragma_lists_the_results_columns(self):
+        self._json("--problem", "sphere", "--maxiter", "50")
+        proc = self._run("query", "SELECT name FROM pragma_table_info('results')")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        names = proc.stdout.splitlines()[1:]
+        self.assertTrue({"peak_rss_mb", "objective_J", "distance_to_optimum"} <= set(names), names)
 
     @unittest.skipIf(os.name == "nt", "peak memory is POSIX-only")
     def test_peak_memory_is_recorded_and_brief_suggests_a_batch_size(self):
@@ -819,29 +800,29 @@ class TestMachineEndToEnd(_CliTest):
 class TestGenericSchema(_ScratchDirTest):
     """Metrics live in JSON; the results view gives each declared metric a column."""
 
-    def test_legacy_record_is_upgraded(self):
-        old = {"id": "r", "coil_type": "banana", "solver": "stage2", "equilibrium": "nfp5",
-               "field_error": 0.01, "objective_J": None, "metrics": {"lead_end_curvature": 3.0},
-               "params": {"solver": "stage2", "cc_weight": 10}, "status": "pass"}
-        new = run.upgrade_record(old)
-        self.assertEqual((new["adapter"], new["mode"], new["target"]), ("banana", "stage2", "nfp5"))
-        self.assertEqual(new["metrics"], {"field_error": 0.01, "lead_end_curvature": 3.0})
-        self.assertEqual(new["params"], {"mode": "stage2", "cc_weight": 10})
-        self.assertNotIn("field_error", new)
-        self.assertEqual(run.upgrade_record(new), new, "current records pass through unchanged")
-
     def test_results_view_has_one_column_per_metric(self):
         layout = self._layout()
-        run.write_run_record(layout.runs_dir, {
+        records.write_run_record(layout.runs_dir, {
             "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
             "created_at": "2026-01-01", "metrics": {"objective_J": 0.25, "optimizer_success": True},
         })
-        run.rebuild(layout, toy)
-        out = run.query(layout, toy, "SELECT objective_J, optimizer_success, final_step FROM results", 5)
+        records.rebuild(layout, toy)
+        out = records.query(layout, toy, "SELECT objective_J, optimizer_success, final_step FROM results", 5)
         self.assertEqual(out.splitlines(), ["objective_J\toptimizer_success\tfinal_step", "0.25\t1\t"])
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             indexes = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         self.assertTrue({"idx_metric_objective_J", "idx_metric_distance_to_optimum"} <= indexes)
+
+    def test_runs_table_and_indexes_come_from_the_column_list(self):
+        layout = self._layout()
+        records.rebuild(layout, toy)
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
+            columns = [r[1] for r in db.execute("PRAGMA table_info(runs)")]
+            spec_index = [r[2] for r in db.execute("PRAGMA index_info(idx_runs_spec)")]
+            group_index = [r[2] for r in db.execute("PRAGMA index_info(idx_runs_target)")]
+        self.assertEqual(columns, list(records.COLUMN_NAMES))
+        self.assertEqual((spec_index, group_index), (["spec_hash", "replicate"], ["mode", "target"]),
+                         "dedupe and per-group lookups need their composite indexes, in column order")
 
     def test_metric_names_must_be_identifiers(self):
         bad = types.SimpleNamespace(**{m: getattr(toy, m) for m in adapter.CONTRACT_MEMBERS})
@@ -852,8 +833,8 @@ class TestGenericSchema(_ScratchDirTest):
     def test_metric_named_like_a_run_column_is_refused(self):
         layout = self._layout()
         clash = types.SimpleNamespace(NAME="clash", METRICS={"status": None})
-        with self.assertRaisesRegex(run.HarnessError, "reuse run column names"):
-            run.ensure_results_view(layout, clash)
+        with self.assertRaisesRegex(campaign.HarnessError, "reuse run column names"):
+            records.ensure_results_view(layout, clash)
 
 
 
@@ -868,17 +849,17 @@ class TestReviewFixes(_ScratchDirTest):
     def test_parallel_openers_migrate_an_old_db_once_without_losing_rows(self):
         layout = self._layout()
         for i in range(20):
-            run.write_run_record(layout.runs_dir, self._toy_record(f"r{i:02d}", f"2026-01-{i + 1:02d}"))
+            records.write_run_record(layout.runs_dir, self._toy_record(f"r{i:02d}", f"2026-01-{i + 1:02d}"))
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
             db.execute("PRAGMA user_version = 2")
         go = self.root / "go"
         script = (
-            "import sys, time; sys.path.insert(0, sys.argv[1]); import run; from adapters import toy; "
+            "import sys, time; sys.path.insert(0, sys.argv[1]); import campaign, records; from adapters import toy; "
             "from pathlib import Path; d = Path(sys.argv[2]); "
-            "layout = run.Layout(d, d / 'scratch', d / 'artifacts', 'none'); "
+            "layout = campaign.Layout(d, d / 'scratch', d / 'artifacts', 'none'); "
             "[time.sleep(0.01) for _ in iter(lambda: (d / 'go').exists(), True)]; "
-            "run.open_db(layout, toy).close()"
+            "records.open_db(layout, toy).close()"
         )
         procs = [subprocess.Popen([sys.executable, "-c", script, str(REPO_ROOT), str(self.root)],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
@@ -888,7 +869,7 @@ class TestReviewFixes(_ScratchDirTest):
             _, err = proc.communicate(timeout=60)
             self.assertEqual(proc.returncode, 0, err.decode())
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], records.SCHEMA_VERSION)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 20)
         self.assertEqual(list(self.root.glob("results.db.rebuild*")), [], "no temp DB left behind")
         self.assertEqual(len(list(self.root.glob("results.db.bak-*"))), 1, "migrated exactly once")
@@ -900,7 +881,7 @@ class TestReviewFixes(_ScratchDirTest):
         adapter_ = types.SimpleNamespace(NAME="x", TARGET_FLAG="problem", SEED_FLAG=None, EXECUTION_FLAGS=(),
                                          run_experiment=interrupted)
         args = argparse.Namespace(campaign="c", replicate=0, mode="optimize", problem="sphere")
-        record = run.execute(adapter_, self._layout(), args, "v0")
+        record = runner.execute(adapter_, self._layout(), args, "v0")
         self.assertEqual((record["status"], record["status_reason"]), ("crash", "cancelled"))
         self.assertTrue((self.root / "runs" / f"{record['id']}.json").exists())
 
@@ -913,7 +894,7 @@ class TestReviewFixes(_ScratchDirTest):
             "print(json.dumps({'id': 'big', 'padding': 'x' * 2_000_000}))"
         )
         outcome = {}
-        worker = threading.Thread(daemon=True, target=lambda: outcome.update(result=run.launch_runs(
+        worker = threading.Thread(daemon=True, target=lambda: outcome.update(result=runner.launch_runs(
             layout, [[str(self.root)]], 1, 0, [], self.root / "child.log",
             program=(sys.executable, "-c", script),
         )))
@@ -923,49 +904,36 @@ class TestReviewFixes(_ScratchDirTest):
         results, stop, failed = outcome["result"]
         self.assertEqual(([r["id"] for r in results], stop, failed), (["big"], None, 0))
 
-    # 5 — importing an export keeps its provenance and evidence
-    def test_import_keeps_provenance_and_evidence(self):
-        layout = self._layout()
-        export = self.root / "export.jsonl"
-        exported = self._toy_record("e1", "2026-01-01", provenance={"solver_identity": "abc", "adapter": {"command": ["x"]}},
-                                    evidence={"log": {"sha256": "f00", "bytes": 3}})
-        export.write_text(json.dumps(exported) + "\n")
-        run.import_jsonl(layout, export)
-        record = json.loads((layout.runs_dir / "e1.json").read_text())
-        self.assertEqual(record["provenance"]["solver_identity"], "abc")
-        self.assertEqual(record["provenance"]["imported_from"], str(export))
-        self.assertEqual(record["evidence"], {"log": {"sha256": "f00", "bytes": 3}})
-
     # 7b — a spec running elsewhere is waited for, not dropped
     def test_in_progress_spec_is_retried_until_recorded(self):
         campaigns = self.root / "campaigns"
         demo = _make_campaign(campaigns, "demo", {"adapter": "toy"})
-        layout = run.resolve_layout(demo, {})
+        layout = campaign.resolve_layout(demo, {})
         parser = run.build_parser(toy, "demo")
         planned = [batch.PlannedRun("s", {"problem": "sphere", "maxiter": 50}, 0)]
-        argvs, _, errors = run.check_planned(toy, layout, parser, planned, "demo", "b1", run._IdentityCache(toy))
+        argvs, _, errors = runner.check_planned(toy, layout, parser, planned, "demo", "b1", runner._IdentityCache(toy))
         self.assertEqual(errors, [])
-        args = run.with_seed(toy, parser.parse_args(argvs[0]))
-        digest = run.spec_hash(toy, run.run_spec(args), toy.solver_identity(args))
+        args = runner.with_seed(toy, parser.parse_args(argvs[0]))
+        digest = runner.spec_hash(toy, runner.run_spec(args), toy.solver_identity(args))
         claim = locks.try_lock(layout.claims_dir / f"{digest}-0.lock")
         threading.Timer(1.5, locks.release, args=(claim,)).start()
-        environ = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine"),
-                   run.MAX_PARALLEL_ENV: "2", run.SLOTS_DIR_ENV: str(self.root / "slots")}
-        original_env, original_delay = dict(os.environ), run.IN_PROGRESS_RETRY_SECONDS
+        environ = {**os.environ, campaign.CAMPAIGNS_DIR_ENV: str(campaigns), campaign.MACHINE_DIR_ENV: str(self.root / "machine"),
+                   campaign.MAX_PARALLEL_ENV: "2"}
+        original_env, original_delay = dict(os.environ), runner.IN_PROGRESS_RETRY_SECONDS
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original_env)))
         self.addCleanup(setattr, run, "IN_PROGRESS_RETRY_SECONDS", original_delay)
         os.environ.update(environ)
-        run.IN_PROGRESS_RETRY_SECONDS = 0.5
-        results, stop, failed = run.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log")
+        runner.IN_PROGRESS_RETRY_SECONDS = 0.5
+        results, stop, failed = runner.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log")
         self.assertEqual(([r["status"] for r in results], stop, failed), (["pass"], None, 0))
         self.assertIn("running in another process", (self.root / "child.log").read_text(),
                       "the first attempt must have found the spec claimed")
 
     # 9 — Path values are recorded as strings; replay restores flag types
     def test_path_values_are_json_safe(self):
-        spec = run.run_spec(argparse.Namespace(campaign="c", replicate=0, mode="m", input=Path("/data/in.h5")))
+        spec = runner.run_spec(argparse.Namespace(campaign="c", replicate=0, mode="m", input=Path("/data/in.h5")))
         self.assertEqual(spec["input"], "/data/in.h5")
-        self.assertIsInstance(run.spec_hash(toy, spec, "v"), str)
+        self.assertIsInstance(runner.spec_hash(toy, spec, "v"), str)
 
     def test_replay_uses_recorded_values_as_recorded(self):
         parser = argparse.ArgumentParser()
@@ -975,18 +943,18 @@ class TestReviewFixes(_ScratchDirTest):
         parser.add_argument("--verbose", action="store_true")
         parser.add_argument("--seed", type=int, default=7)
         parser.add_argument("--added-later", default="x")
-        recorded = json.loads(json.dumps(run.run_spec(parser.parse_args(
+        recorded = json.loads(json.dumps(runner.run_spec(parser.parse_args(
             ["--input", "/data/in.h5", "--sizes", "3", "4", "--verbose"]
         )) | {"seed": None}))
         recorded.pop("added_later")
-        args = run.args_from_params(parser, recorded, 2)
+        args = runner.args_from_params(parser, recorded, 2)
         self.assertEqual(
             (args.input, args.sizes, args.verbose, args.seed, args.added_later, args.replicate),
             ("/data/in.h5", [3, 4], True, None, "x", 2),
             "lists, booleans and explicit None survive; paths come back as strings; new flags get defaults",
         )
-        with self.assertRaisesRegex(run.HarnessError, "no longer has"):
-            run.args_from_params(parser, {"removed_flag": 1}, 0)
+        with self.assertRaisesRegex(campaign.HarnessError, "no longer has"):
+            runner.args_from_params(parser, {"removed_flag": 1}, 0)
 
     def test_nested_paths_are_json_safe(self):
         self.assertEqual(contract.clean({"a": [Path("/x"), (Path("/y"), 1.0)]}), {"a": ["/x", ["/y", 1.0]]})
@@ -1007,7 +975,7 @@ class TestReviewRound2(_ScratchDirTest):
         order = []
 
         def first():
-            with run.campaign_db_lock(layout):
+            with records.campaign_db_lock(layout):
                 order.append("first in")
                 entered.set()
                 release_first.wait(5)
@@ -1015,7 +983,7 @@ class TestReviewRound2(_ScratchDirTest):
 
         def second():
             entered.wait(5)
-            with run.campaign_db_lock(layout):
+            with records.campaign_db_lock(layout):
                 order.append("second in")
 
         threads = [threading.Thread(target=first), threading.Thread(target=second)]
@@ -1033,11 +1001,11 @@ class TestReviewRound2(_ScratchDirTest):
         link = self.root.parent / f"{self.root.name}-alias"
         link.symlink_to(self.root, target_is_directory=True)
         self.addCleanup(link.unlink)
-        alias = run.Layout(link, self.root / "scratch", self.root / "artifacts", "none")
+        alias = campaign.Layout(link, self.root / "scratch", self.root / "artifacts", "none")
         done = threading.Event()
 
         def nested():
-            with run.campaign_db_lock(layout), run.campaign_db_lock(alias):
+            with records.campaign_db_lock(layout), records.campaign_db_lock(alias):
                 done.set()
 
         threading.Thread(target=nested, daemon=True).start()
@@ -1057,18 +1025,18 @@ class TestReviewRound2(_ScratchDirTest):
 
     def test_rebuild_creates_the_results_view(self):
         layout = self._layout()
-        run.write_run_record(layout.runs_dir, {
+        records.write_run_record(layout.runs_dir, {
             "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
             "created_at": "2026-01-01", "metrics": {"objective_J": 2.0},
         })
-        run.rebuild(layout, toy)
+        records.rebuild(layout, toy)
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             self.assertEqual(db.execute("SELECT objective_J FROM results").fetchall(), [(2.0,)])
 
     def test_promotion_base_check_does_not_fingerprint_the_solver(self):
         campaigns = self.root / "campaigns"
         demo = _make_campaign(campaigns, "demo", {"adapter": "toy"})
-        layout = run.resolve_layout(demo, {})
+        layout = campaign.resolve_layout(demo, {})
         plan = self.root / "plan.json"
         plan.write_text(json.dumps({
             "hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
@@ -1086,7 +1054,7 @@ class TestReviewRound2(_ScratchDirTest):
         self.addCleanup(setattr, toy, "solver_identity", original)
         toy.solver_identity = identity
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = run.run_batch(toy, layout, run.build_parser(toy, "demo"), "demo", plan, 1, dry_run=True)
+            code = runner.run_batch(toy, layout, run.build_parser(toy, "demo"), "demo", plan, 1, dry_run=True)
         self.assertEqual(code, 0)
         self.assertIn("confirm: top 1 of screen", out.getvalue())
 
@@ -1098,10 +1066,10 @@ class TestReviewFixesEndToEnd(_CliTest):
     @unittest.skipIf(os.name == "nt", "uses POSIX locks from the test process")
     def test_replay_waits_for_a_free_slot(self):
         original = self._json("--problem", "sphere", "--maxiter", "50")
-        env = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine"),
-               run.SLOTS_DIR_ENV: str(self.root / "slots"), run.MAX_PARALLEL_ENV: "1"}
-        env.pop(run.CAMPAIGN_ENV, None)
-        held = locks.acquire_slot(self.root / "slots", 1)
+        env = {**os.environ, campaign.CAMPAIGNS_DIR_ENV: str(self.campaigns), campaign.MACHINE_DIR_ENV: str(self.root / "machine"),
+               campaign.MAX_PARALLEL_ENV: "1"}
+        env.pop(campaign.CAMPAIGN_ENV, None)
+        held = locks.acquire_slot(self.root / "machine" / "slots", 1)
         proc = subprocess.Popen([sys.executable, str(REPO_ROOT / "run.py"), "replay", original["id"]],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=REPO_ROOT)
         time.sleep(2)

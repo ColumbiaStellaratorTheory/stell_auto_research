@@ -14,7 +14,6 @@ campaigns/*/config.json
 campaigns/*/results.db
 campaigns/*/results.db-shm
 campaigns/*/results.db-wal
-campaigns/*/results.jsonl
 campaigns/*/results.db.*
 campaigns/*/runs/
 campaigns/*/blobs/

@@ -85,11 +85,6 @@ class TestLessons(unittest.TestCase):
     def test_titles(self):
         self.assertEqual(analysis.lesson_titles(self.TEXT), ["2026-01-01 first", "2026-01-02 second"])
 
-    def test_entries_include_their_body(self):
-        entries = analysis.lesson_entries(self.TEXT)
-        self.assertEqual(entries[0], "## 2026-01-01 — first\n- kind: recipe")
-        self.assertEqual(len(entries), 2)
-
 
 class TestRenderBrief(unittest.TestCase):
     """The brief stays fixed-size and reports the key campaign state."""

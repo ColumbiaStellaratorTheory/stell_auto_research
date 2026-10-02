@@ -23,7 +23,6 @@ adapter.py                ← looks up the adapter a campaign's config.json name
 contract.py               ← the harness↔adapter contract
 adapters/__init__.py      ← registry of installed adapters (static imports)
 adapters/<solver>.py      ← solver-specific glue (the only file that knows your solver)
-schema.sql                ← database schema (applied automatically)
 campaigns/<name>/
   config.json             ← which adapter + its settings (solver paths, interpreter)
   program.md              ← agent instructions for this campaign
@@ -31,7 +30,6 @@ campaigns/<name>/
   runs/<run-id>.json      ← one record per run: the source of truth
   blobs/                  ← evidence files (logs, results, solver patches) by content hash
   results.db              ← query index of runs/ (`runs` table + `results` view)
-  results.jsonl           ← flat export of runs/, written by `run.py rebuild`
   batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, run ids
   claims/                 ← per-spec locks (a spec runs in one process at a time)
   scratch/                ← live run directories
@@ -91,7 +89,7 @@ python run.py query "SELECT status, target, seed, objective_J FROM results"
   shell overrides the config value. This avoids shell-specific `export`
   syntax.
 
-`config.json` and the run data (`runs/`, `blobs/`, `results.*`, `scratch/`,
+`config.json` and the run data (`runs/`, `blobs/`, `results.db`, `scratch/`,
 `artifacts/`) are gitignored; `program.md` and `LESSONS.md` are yours to commit
 or not.
 
@@ -105,17 +103,12 @@ experiment is:
 run.py  →  adapter.run_experiment(args, run)  →  ExperimentOutcome  →  runs/<id>.json  →  results.db
 ```
 
-The adapter (see `contract.py` for the interface) owns everything about your
-solver: which flags exist (`add_arguments`), which modes it has
-(`MODES`, chosen with `--mode`), which flag names the target configuration
-(`TARGET_FLAG`),
-which flag is its RNG seed (`SEED_FLAG`), which metrics it emits and whether
-each should go down or up (`METRICS`), what fingerprints its code
-(`solver_identity`), and how to run one experiment end-to-end
-(`run_experiment`) — whether that's a single subprocess or a chained pipeline.
-It returns metrics plus what the run used (provenance) and which files to
-keep (evidence). The core records the full parsed command line of every run,
-so no flag is ever lost.
+The adapter owns everything about your solver: its flags, modes and metrics,
+and how to run one experiment end-to-end — a single subprocess or a chained
+pipeline. It returns metrics plus what the run used (provenance) and which
+files to keep (evidence). The full interface is described in one place, the
+docstring of `contract.py`. The core records the full parsed command line of
+every run, so no flag is ever lost.
 
 ## Reproducibility
 
@@ -131,14 +124,13 @@ so no flag is ever lost.
 - **Provenance.** Every record keeps the solver identity, the exact solver
   command, input-file hashes, the harness commit, and the platform.
 - **Evidence.** Files the adapter names (log, results, solver patch) are kept
-  in `blobs/` by content hash, whatever `KEEP_ARTIFACTS` says.
+  in `blobs/` by content hash, whatever `AUTORESEARCH_KEEP_ARTIFACTS` says.
 - **Replay.** `python run.py replay <run-id>` re-runs a recorded experiment
   from its spec and compares status and metrics within the adapter's
   `REPLAY_TOLERANCE`; it exits 2 on a mismatch and says whether the solver
   changed since. A replay skips dedupe but still waits for a run slot.
-- **Rebuild.** `python run.py rebuild` regenerates `results.db` and
-  `results.jsonl` from `runs/`. `--from-jsonl FILE` first imports records
-  from an older harness's `results.jsonl`.
+- **Rebuild.** `python run.py rebuild` regenerates `results.db` from
+  `runs/`.
 
 ## Commands
 
@@ -148,12 +140,9 @@ so no flag is ever lost.
 | `python run.py brief [--campaign C]` | fixed-size digest: counts per mode/target, Pareto fronts over the adapter's goal metrics, recent runs, crash causes, replicate spread, runs since the front last moved, latest lessons |
 | `python run.py query "SQL" [--limit N]` | one read-only SQL statement, tab-separated, capped (default 50 rows) |
 | `python run.py replay <run-id>` | re-run a recorded experiment and compare |
-| `python run.py rebuild [--from-jsonl FILE]` | regenerate `results.db` / `results.jsonl` from `runs/` |
-| `python run.py campaigns` | every campaign: adapter, run counts, last run, runs since its front moved |
-| `python run.py import-lessons --from OTHER` | append another campaign's lessons to this one's `LESSONS.md`, marked as priors |
+| `python run.py rebuild` | regenerate `results.db` from `runs/` |
 | `python run.py batch FILE [--parallel N] [--dry-run]` | run a planned batch of experiments (below) |
-| `python run.py machine [--max-parallel N] [--usable-cores C] [--usable-memory-gb M]` | hardware, run slots, measured run cost and sizing; flags save machine settings |
-| `python run.py schema` | DB columns and the adapter's metric goals, for the program file |
+| `python run.py status [--max-parallel N] [--usable-cores C] [--usable-memory-gb M]` | hardware, machine settings and run slots, then every campaign: adapter, run counts, last run, runs since its front moved, measured run cost and sizing per mode; flags save machine settings |
 
 A crashed run's `crash_signature` is the line in its log that names the failure
 (the last `...Error:` line, else the last line), with paths and numbers
@@ -203,19 +192,20 @@ finishes. The format is documented at the top of `batch.py`:
 
 Every run, from every campaign, holds one of the machine's run slots while it
 executes, so the machine is never oversubscribed however many agents and
-batches run at once. Slots are lock files under `~/.autoresearch/slots`,
-released by the OS if a run dies.
+batches run at once. Slots are lock files under `~/.autoresearch/slots`
+(`$AUTORESEARCH_MACHINE_DIR/slots` when set), released by the OS if a run dies.
 
-`python run.py machine` shows what the harness sees and what fits:
+`python run.py status` shows what the harness sees and what fits:
 
 - **hardware** — OS, usable CPUs (affinity and SLURM aware), performance
   cores on Apple Silicon, memory, GPUs (nvidia-smi; Apple's shared-memory GPU),
   scheduler;
 - **settings** — `~/.autoresearch/machine.json` (`max_parallel`,
   `usable_cores`, `usable_memory_gb`), written by the same command:
-  `python run.py machine --max-parallel 6 --usable-cores 60 --usable-memory-gb 100`;
-- **per campaign and mode** — median run time, peak memory and threads of the
-  recorded runs, how many fit at once (`usable cores ÷ threads`, capped by
+  `python run.py status --max-parallel 6 --usable-cores 60 --usable-memory-gb 100`;
+- **per campaign** — adapter, run counts (pass/fail/crash), last run, runs
+  since its front moved, and per mode the median run time, peak memory and
+  threads of the recorded runs, how many fit at once (`usable cores ÷ threads`, capped by
   `usable memory ÷ peak memory`), and, with `"plan_minutes"` in the
   campaign's config, the batch size that fills one planning interval
   (`runs at once × planning interval ÷ run time`).
@@ -233,12 +223,10 @@ often to plan, session budget) and fills all of this in.
 | `AUTORESEARCH_CAMPAIGN` | *(optional)* campaign to use when `--campaign` is not given. |
 | `AUTORESEARCH_CAMPAIGNS_DIR` | *(optional)* where campaigns live (default `<repo>/campaigns`). |
 | `AUTORESEARCH_MAX_PARALLEL` | *(optional)* machine-wide run slots (default 1). |
-| `AUTORESEARCH_SLOTS_DIR` | *(optional)* where the slot lock files live (default `~/.autoresearch/slots`). |
-| `AUTORESEARCH_MACHINE_DIR` | *(optional)* machine-wide state: `machine.json` and slots (default `~/.autoresearch`). |
-| `AUTORESEARCH_BLOBS_DIR` | *(optional)* one evidence store shared by every campaign (default: each campaign's `blobs/`). |
-| `OUTPUT_BASE` | *(optional)* scratch dir for live runs (default `campaigns/<name>/scratch`). |
-| `KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `ARTIFACTS_DIR/<run-id>`. |
-| `ARTIFACTS_DIR` | *(optional)* where kept run dirs land, named by run id (default `campaigns/<name>/artifacts`). |
+| `AUTORESEARCH_MACHINE_DIR` | *(optional)* machine-wide state: `machine.json` and the `slots/` lock files (default `~/.autoresearch`). |
+| `AUTORESEARCH_SCRATCH_DIR` | *(optional)* scratch dir for live runs (default `campaigns/<name>/scratch`). |
+| `AUTORESEARCH_KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `AUTORESEARCH_ARTIFACTS_DIR/<run-id>`. |
+| `AUTORESEARCH_ARTIFACTS_DIR` | *(optional)* where kept run dirs land, named by run id (default `campaigns/<name>/artifacts`). |
 
 Any of these can also go in a campaign's `config.json` `env` map.
 
@@ -279,7 +267,8 @@ You never touch `run.py`. Either:
 
 1. Run `/setup-harness` — it detects your solver, installs deps, and generates
    the adapter and campaign for you; **or**
-2. Write `adapters/<your-solver>.py` implementing the `contract.py` interface,
+2. Write `adapters/<your-solver>.py` implementing the interface described in
+   `contract.py`'s docstring,
    using `adapters/toy.py` as the template; register it in
    `adapters/__init__.py` (one import + one `REGISTRY` entry);
    then create `campaigns/<name>/config.json` with `"adapter": "<your-solver>"`.
@@ -292,8 +281,11 @@ batch can promote the best cheap runs to the costly mode.
 ## Project structure
 
 ```
-contract.py                     ← harness↔adapter contract (ExperimentOutcome, helpers)
-run.py                          ← generic experiment runner (solver-agnostic)
+contract.py                     ← harness↔adapter contract: its docstring is the full interface
+run.py                          ← CLI: argument parsing and dispatch
+runner.py                       ← spec/seed/hash, run, replay, batch execution, brief and status
+records.py                      ← run files, evidence store, results.db (columns defined once), query
+campaign.py                     ← campaign selection, config.json, layout, env vars, run slots
 analysis.py                     ← derived views: crash signatures, Pareto fronts, the brief
 batch.py                        ← batch files: validation, spec expansion, promotion, early stop
 locks.py                        ← OS-released file locks for run slots and spec claims
@@ -302,7 +294,6 @@ adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)
 examples/toy_solver.py          ← the toy adapter's solver
-schema.sql                      ← database schema
 templates/program_template.md   ← skeleton for a campaign's program.md
 templates/LESSONS.md            ← scaffold for a campaign's LESSONS.md
 campaigns/<name>/               ← one folder per campaign (created by /setup-harness)

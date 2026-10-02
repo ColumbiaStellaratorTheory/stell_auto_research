@@ -1,6 +1,6 @@
 """Shared harness↔adapter contract.
 
-The harness core (`run.py`) is solver-agnostic: it owns campaign selection, the
+The harness core (`run.py` and the modules it calls) is solver-agnostic: it owns campaign selection, the
 run records, the scratch/evidence lifecycle, and the agent-facing CLI skeleton.
 Everything solver-specific — how to invoke a solver, what its outputs mean,
 how to validate a result — lives behind a *solver adapter*, registered in
@@ -21,7 +21,8 @@ An adapter is a module exposing:
                                      default so it always has a value.
     REQUIRED_ENV      tuple[str]   — env vars that must be set before a run; the
                                      core checks them and refuses to start
-                                     without them.
+                                     without them. List optional ones in the
+                                     adapter's docstring.
     EXECUTION_FLAGS   tuple[str]   — argparse dests that change how a run
                                      executes but not what it computes (timeout,
                                      thread count, solver location). Recorded,
@@ -43,7 +44,10 @@ An adapter is a module exposing:
                                      emits → its goal: "min", "max", or None
                                      (recorded, not optimized). Goals drive the
                                      Pareto front in `run.py brief`.
-    add_arguments(parser) -> None  — register the solver's CLI flags.
+    add_arguments(parser) -> None  — register the solver's CLI flags: the
+                                     target flag plus every solver parameter
+                                     the agent may set, with the solver's real
+                                     defaults.
     solver_identity(args) -> str   — fingerprint of the solver code that will
                                      run (e.g. commit + uncommitted-diff hash).
                                      Part of the spec hash, so a changed solver
@@ -56,15 +60,22 @@ An adapter is a module exposing:
                                      an outcome with status "crash"/"fail".
                                      Launch solvers with `run_solver`, so a
                                      timeout or cancellation kills the whole
-                                     process tree.
+                                     process tree, and pass thread counts via
+                                     `thread_env`.
+
+`RunContext` (the run's id and scratch dir) and `ExperimentOutcome` (status,
+metrics, validation verdict, provenance, evidence, parent run) are defined
+below; their docstrings are part of this contract. Helpers for adapters:
+`run_solver`, `thread_env`, `git_output` (for `solver_identity`),
+`sha256_file` (input-file hashes for provenance) and `clean`.
 
 Adapters read environment variables when a run starts, never at import:
 every registered adapter is imported on every run, including campaigns that
 use a different one.
 
 The core records every parsed flag of a run as JSON. On `run.py replay` an
-adapter receives those recorded values (paths as strings, tuples as lists),
-so convert where the type matters (e.g. `Path(args.input)`).
+adapter receives those recorded values as JSON types (paths as strings,
+tuples as lists), so convert where the type matters (e.g. `Path(args.input)`).
 
 Metric keys are snake_case names declared in METRICS. The core stores every
 emitted metric in the run's `metrics` JSON; the `results` view gives each

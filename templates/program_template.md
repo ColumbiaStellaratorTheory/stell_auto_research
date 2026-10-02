@@ -119,10 +119,11 @@ Enforced limits — do not go below/above:
 {{ARTIFACT_LAYOUT}}
 <!-- Table generated from /setup-harness setup answers:
      | Location | Path | Notes |
-     - OUTPUT_BASE: scratch for live runs (default campaigns/<slug>/scratch);
-       every run's log/results are kept as evidence under blobs/
-     - ARTIFACTS_DIR + KEEP_ARTIFACTS policy: where completed runs' outputs
-       are kept, named by run id (joins to results.db id)
+     - AUTORESEARCH_SCRATCH_DIR: scratch for live runs (default
+       campaigns/<slug>/scratch); every run's log/results are kept as
+       evidence under blobs/
+     - AUTORESEARCH_ARTIFACTS_DIR + AUTORESEARCH_KEEP_ARTIFACTS policy: where
+       completed runs' outputs are kept, named by run id (joins to results.db id)
      - any seed/intermediate store the adapter reuses across runs
      - runs/ (source of truth), blobs/, results.db: campaigns/{{CAMPAIGN_SLUG}}/ -->
 
@@ -152,7 +153,9 @@ modify the database.
 ```
 {{SCHEMA}}
 ```
-<!-- Paste the output of `python run.py schema --campaign {{CAMPAIGN_SLUG}}`. -->
+<!-- Paste the output of
+     `python run.py query --campaign {{CAMPAIGN_SLUG}} "PRAGMA table_info(results)"`
+     and the adapter's METRICS goals. -->
 
 Query the `results` view: the `runs` columns plus one column per metric
 (`SELECT target, objective_J FROM results ...`). `runs` holds the same rows
@@ -243,6 +246,6 @@ suggests a better way to spend the next experiment:
      timeout per mode, which devices passed the probe, session budget.
      Then point the agent at the live numbers: -->
 
-`python run.py machine` and the last lines of `run.py brief` show the run
+`python run.py status` and the last lines of `run.py brief` show the run
 slots, each mode's measured run time and memory, how many runs fit at once,
 and the batch size that fills one planning interval. Size batches from them.

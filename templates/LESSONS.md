@@ -23,7 +23,7 @@ lesson turns out to be wrong, append a correction that references it.
 ```markdown
 ## YYYY-MM-DD — short title
 
-- kind: recipe | dead-end | crash-cause | metric-caveat | correction | import
+- kind: recipe | dead-end | crash-cause | metric-caveat | correction
 - scope: the mode / target / parameter region the lesson covers
 - claim: one falsifiable sentence, with numbers
 - evidence: run ids, or the query that reproduces it
@@ -33,7 +33,6 @@ lesson turns out to be wrong, append a correction that references it.
 
 `confirmed` means the claim held in at least two independent runs (different
 seeds or replicates). A `correction` names the entry it corrects in `scope`.
-`import` entries are written by `run.py import-lessons`.
 
 ---
 

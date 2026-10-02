@@ -2,7 +2,7 @@
 
 Pure functions over *run views* — dicts with the run's identity fields plus
 `values` (every non-null metric) and `spec_base` (hash of the spec without seed
-and execution flags, shared by replicates). `run.py` builds the views from
+and execution flags, shared by replicates). `runner.py` builds the views from
 results.db. Nothing here decides anything for the agent; it summarizes.
 """
 
@@ -133,17 +133,6 @@ def runs_since_front_change(runs: Sequence[Mapping], metric_goals: Mapping[str, 
 def lesson_titles(text: str) -> list[str]:
     """Titles of dated lesson entries (`## YYYY-MM-DD — title`), oldest first."""
     return [f"{m.group(1)} {m.group(2)}" for m in map(_LESSON_HEADING.match, text.splitlines()) if m]
-
-
-def lesson_entries(text: str) -> list[str]:
-    """Each dated lesson entry as text: its heading line through the line before the next one."""
-    entries: list[list[str]] = []
-    for line in text.splitlines():
-        if _LESSON_HEADING.match(line):
-            entries.append([line])
-        elif entries:
-            entries[-1].append(line)
-    return ["\n".join(lines).rstrip() for lines in entries]
 
 
 # ---------------------------------------------------------------------------
