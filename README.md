@@ -5,16 +5,15 @@ Autonomous AI agent harness for optimization campaigns. Fork of
 [Andrej Karpathy](https://github.com/karpathy), adapted from LLM training to
 solver-driven optimization.
 
-It does **not** do the physics — that's yours. It does the work *around* the
-physics: you describe one experiment as a command, and it runs your parameter
+It does **not** do the science — that's yours. It does the work *around* it:
+you describe one experiment as a command, and it runs your parameter
 scans, records every result (and every failure) in a queryable SQLite database,
 and keeps an append-only `LESSONS.md` so nothing learned is lost between
 sessions. You decide what to try; it handles the loop and the bookkeeping.
 
-The harness core is **solver-agnostic**. You bring your optimizer — simsopt,
-DESC, anything that runs from a command — behind a small *adapter*, and the core
-never changes. A stdlib-only toy adapter ships as the reference; a real physics
-adapter (banana coils on simsopt) lives in [`examples/banana/`](examples/banana/).
+The harness core is **solver-agnostic**. You bring your optimizer — anything
+that runs from a command — behind a small *adapter*, and the core never
+changes. A stdlib-only toy adapter ships as the reference.
 
 ## How it works
 
@@ -31,7 +30,7 @@ campaigns/<name>/
   LESSONS.md              ← append-only research memory (agent + human)
   runs/<run-id>.json      ← one record per run: the source of truth
   blobs/                  ← evidence files (logs, results, solver patches) by content hash
-  results.db              ← query index of runs/ (query with SQL)
+  results.db              ← query index of runs/ (`runs` table + `results` view)
   results.jsonl           ← flat export of runs/, written by `run.py rebuild`
   batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, run ids
   claims/                 ← per-spec locks (a spec runs in one process at a time)
@@ -55,10 +54,10 @@ If you use Claude Code, the fastest path is the bundled setup skill:
 /setup-harness
 ```
 
-It detects your solver stack (simsopt / DESC / other), **installs any missing
-dependencies**, interviews you about your campaign, generates a solver adapter
-and a campaign folder, and ends with a real smoke run. You do not need to read
-anything below first.
+It finds your solver and the interpreter it runs in, **installs any missing
+dependencies**, detects your hardware, interviews you about your campaign,
+generates a solver adapter and a campaign folder, and ends with a real smoke
+run. You do not need to read anything below first.
 
 To try the harness without any solver, use the toy adapter:
 
@@ -66,8 +65,7 @@ To try the harness without any solver, use the toy adapter:
 mkdir -p campaigns/demo
 echo '{"adapter": "toy"}' > campaigns/demo/config.json
 python run.py --problem rastrigin --dim 4 --seed 3
-sqlite3 campaigns/demo/results.db -header -column \
-  "SELECT status, equilibrium, objective_J, json_extract(params,'$.seed') AS seed FROM runs"
+python run.py query "SELECT status, target, seed, objective_J FROM results"
 ```
 
 ## Campaigns
@@ -87,8 +85,7 @@ sqlite3 campaigns/demo/results.db -header -column \
 }
 ```
 
-- `adapter` — a key in `adapters/__init__.py` `REGISTRY` (`"toy"`,
-  `"simsopt_banana"`).
+- `adapter` — a key in `adapters/__init__.py` `REGISTRY` (e.g. `"toy"`).
 - `env` *(optional)* — settings the adapter reads (solver paths, the
   interpreter that has your solver installed). A variable already set in your
   shell overrides the config value. This avoids shell-specific `export`
@@ -110,14 +107,15 @@ run.py  →  adapter.run_experiment(args, run)  →  ExperimentOutcome  →  run
 
 The adapter (see `contract.py` for the interface) owns everything about your
 solver: which flags exist (`add_arguments`), which modes it has
-(`SOLVER_MODES`), which flag names the target configuration (`TARGET_FLAG`),
+(`MODES`, chosen with `--mode`), which flag names the target configuration
+(`TARGET_FLAG`),
 which flag is its RNG seed (`SEED_FLAG`), which metrics it emits and whether
 each should go down or up (`METRICS`), what fingerprints its code
 (`solver_identity`), and how to run one experiment end-to-end
 (`run_experiment`) — whether that's a single subprocess or a chained pipeline.
-It returns metrics as canonical keys plus what the run used (provenance) and
-which files to keep (evidence). The core records the full parsed command line
-of every run, so no flag is ever lost.
+It returns metrics plus what the run used (provenance) and which files to
+keep (evidence). The core records the full parsed command line of every run,
+so no flag is ever lost.
 
 ## Reproducibility
 
@@ -245,16 +243,18 @@ Any of these can also go in a campaign's `config.json` `env` map.
 ## Results
 
 Every run is written to the campaign's `runs/<run-id>.json` and indexed in
-`results.db` (SQLite). The columns are the same for every solver;
-solver-specific metrics live in the `metrics` JSON column, every flag of the
-run in `params`, and provenance/evidence in their own JSON columns.
+`results.db` (SQLite). The `runs` table is the same for every solver:
+identity, status, timing, and JSON columns for `metrics` (whatever the adapter
+emits), `params` (every flag), `provenance` and `evidence`. The `results` view
+adds one column per metric the adapter declares in `METRICS`, and its goal
+metrics get indexes.
 
 ```bash
 # read-only SQL through the harness (recommended for agents; works without the sqlite3 CLI)
-python run.py query --campaign <name> "SELECT id, objective_J FROM runs WHERE status='pass' ORDER BY objective_J LIMIT 10"
+python run.py query --campaign <name> "SELECT id, target, objective_J FROM results WHERE status='pass' ORDER BY objective_J LIMIT 10"
 
-# a solver-specific metric or parameter from the JSON columns
-python run.py query --campaign <name> "SELECT id, json_extract(metrics,'$.<your_metric>'), json_extract(params,'$.<your_flag>') FROM runs"
+# a parameter from the JSON columns
+python run.py query --campaign <name> "SELECT id, json_extract(params,'$.<your_flag>') FROM runs"
 
 # flat files (for scripts, jq, grep)
 jq 'select(.status=="pass")' campaigns/<name>/runs/*.json
@@ -278,15 +278,14 @@ You never touch `run.py`. Either:
 1. Run `/setup-harness` — it detects your solver, installs deps, and generates
    the adapter and campaign for you; **or**
 2. Write `adapters/<your-solver>.py` implementing the `contract.py` interface,
-   using `adapters/toy.py` as the template and
-   `examples/banana/simsopt_banana.py` for a multi-mode physics example;
-   register it in `adapters/__init__.py` (one import + one `REGISTRY` entry);
+   using `adapters/toy.py` as the template; register it in
+   `adapters/__init__.py` (one import + one `REGISTRY` entry);
    then create `campaigns/<name>/config.json` with `"adapter": "<your-solver>"`.
 
-`run_experiment` can run a single subprocess or a multi-step pipeline (e.g. a
-DESC chain: bumped surface → fixed-boundary equilibrium → coil optimization →
-free-boundary equilibrium). Solver-specific metrics go to the `metrics` JSON
-column.
+`run_experiment` can run a single subprocess or a multi-step pipeline (each
+step's output feeding the next, several `run_solver` calls in one run). An
+adapter with a cheap and a costly stage can expose both as `MODES`, and a
+batch can promote the best cheap runs to the costly mode.
 
 ## Project structure
 
@@ -301,7 +300,6 @@ adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)
 examples/toy_solver.py          ← the toy adapter's solver
-examples/banana/                ← real-world example: banana coils on simsopt
 schema.sql                      ← database schema
 templates/program_template.md   ← skeleton for a campaign's program.md
 templates/LESSONS.md            ← scaffold for a campaign's LESSONS.md
@@ -314,5 +312,4 @@ ROADMAP.md                      ← planned work
 
 ```bash
 python3 -m unittest discover -s tests -t .      # core, with the toy adapter
-python3 -m unittest discover -s examples -t .   # example adapters
 ```

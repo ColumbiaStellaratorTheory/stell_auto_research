@@ -1,6 +1,6 @@
 ---
 name: setup-harness
-description: Interactive first-time setup of the autoresearch harness for the user's own optimizer (simsopt, DESC, or any other). Detects their solver stack, installs missing dependencies, generates a solver adapter + campaign folder (config, program file, lessons), and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to regenerate the program file for a new campaign.
+description: Interactive first-time setup of the autoresearch harness for the user's own optimizer (any program that runs from a command). Finds their solver and its interpreter, installs missing dependencies, generates a solver adapter + campaign folder (config, program file, lessons), and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to regenerate the program file for a new campaign.
 ---
 
 # setup-harness
@@ -33,14 +33,12 @@ Read these before asking anything:
    per campaign under `campaigns/`), `config.json` (`adapter` + `env`), how it
    calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
    hash / dedupe / derived seeds / replay, the artifact layout (`OUTPUT_BASE` /
-   `KEEP_ARTIFACTS` / `ARTIFACTS_DIR`), and `COLUMN_METRIC_KEYS` (the canonical
-   metric keys that get their own DB column; everything else an adapter emits
-   lands in the `metrics` JSON overflow). The core records every parsed flag.
+   `KEEP_ARTIFACTS` / `ARTIFACTS_DIR`). Metrics are stored as JSON; the
+   `results` view gives each of the adapter's `METRICS` a column. The core
+   records every parsed flag.
    `adapters/__init__.py` is the registry of installed adapters.
 3. `adapters/toy.py` — the **reference adapter**: a complete, stdlib-only
    example of the contract. You will model the generated adapter on this.
-   `examples/banana/simsopt_banana.py` is a real physics adapter showing
-   multiple modes, a warm-start seed store and independent validation.
 4. `templates/program_template.md` and `templates/LESSONS.md` — the skeletons
    you fill or copy into the campaign folder later.
 
@@ -50,32 +48,31 @@ Do not read or write dotenv files; adapter settings go in the campaign's
 ## Phase 2 — Identify the solver stack
 
 Ask the user (AskUserQuestion, with detected defaults where possible):
-- **Which optimizer** do they run — simsopt, DESC, or something else?
-- **Where it lives**: the solver repo root, and the Python interpreter that has
-  it installed (often a conda/venv distinct from this repo's env).
-- **Target configurations**: the directory holding the inputs each experiment
-  optimizes against (simsopt: `wout_*.nc` equilibria; DESC: base cases / `.h5`).
+- **Which optimizer** do they run, and how is it launched (a script, a
+  module, a binary, a chain of steps)?
+- **Where it lives**: the solver repo root, and the interpreter or runtime that
+  has it installed (often a conda/venv distinct from this repo's env).
+- **Target configurations**: where the inputs each experiment optimizes
+  against live (input files, named cases, generated configurations).
 
-Verify each path immediately (dir exists; interpreter runs). If the user's
-optimizer **is** the banana/simsopt example, no adapter generation is needed —
-use `"adapter": "simsopt_banana"` (see
-`examples/banana/config.example.json` and `examples/banana/README.md`), skip
-Phase 6's adapter step, and just do dependency check + campaign identity +
-campaign folder + smoke. Otherwise you will generate a new adapter for their
-solver.
+Verify each path immediately (dir exists; interpreter runs). If an adapter for
+their solver is already registered in `adapters/__init__.py`, skip Phase 6's
+adapter step and just do dependency check + campaign identity + campaign
+folder + smoke. Otherwise you will generate a new adapter for their solver.
 
 ## Phase 3 — Dependencies (hard gate before introspection)
 
 A solver whose imports fail produces confusing crashes later, so resolve this
 first:
 1. Probe the chosen interpreter for the framework and its key deps:
-   `<python> -c "import simsopt"` / `"import desc"` (DESC also pulls `jax`).
+   `<python> -c "import <framework>"` for each package the solver imports.
 2. If anything is missing, **guide the install** — do not silently run a heavy
    install:
    - Detect the user's package manager (uv / pip / conda) from their env.
    - For framework install commands, fetch **current** instructions rather than
-     guessing — use the `find-docs` skill or `ctx7` (DESC + jax versions and
-     CPU/GPU extras drift, and a wrong jax build is a classic silent failure).
+     guessing — use the `find-docs` skill or `ctx7` (versions and CPU/GPU
+     extras drift; a wrong accelerator build, e.g. of jax or torch, is a
+     classic silent failure).
    - Show the exact command, get confirmation, run it, then **re-verify the
      import**. No silent fallback.
 3. Do not proceed to introspection until every required import succeeds.
@@ -83,21 +80,21 @@ first:
 ## Phase 4 — Understand the solver & sketch the adapter
 
 You are about to write an adapter; learn the solver's shape first.
-1. **How is one experiment invoked?** A single script/subprocess (like banana's
-   stage2), or a **chained pipeline** of several steps where each step's output
-   feeds the next? (DESC umbilic, e.g., is a 4-step chain per parameter set:
-   build a bumped plasma surface → solve the fixed-boundary equilibrium → stage-2
-   coil optimization → free-boundary equilibrium seeded from the earlier solve.)
+1. **How is one experiment invoked?** A single script/subprocess, or a
+   **chained pipeline** of several steps where each step's output feeds the
+   next (e.g. build an input → solve → optimize → re-solve seeded from the
+   first solve)? Is there a cheap stage and a costly one? Those become
+   separate `MODES`, and batches can promote the best cheap runs.
 2. **Inputs/params** the agent should be able to set (grep the solver's argparse
    or function signatures). These become `add_arguments` flags.
 3. **Outputs**: what does a run produce, and where are the metrics — a
    `results.json`, a returned object, stdout? This becomes `run_experiment`'s
    parsing.
-4. **Metrics → canonical keys**: list the solver's native metric names and map
-   each onto a canonical snake_case key. Keys in `run.py`'s `COLUMN_METRIC_KEYS`
-   get a dedicated column; everything else is preserved in the `metrics` JSON
-   blob (so nothing is lost — no schema change needed).
-5. **Target-configuration resolution**: how the target flag (`--equilibrium`, a base-case key, …) maps
+4. **Metrics → keys**: list the solver's native metric names and map each
+   onto a snake_case key; these become `METRICS` (no schema change is ever
+   needed — metrics are stored as JSON and the `results` view gives each a
+   column).
+5. **Target-configuration resolution**: how the target flag (an input file, a named case, …) maps
    to an actual input file or case.
 6. **Validation / intermediates**: any independent check (field-line tracing,
    convergence) that should set `validated`, and any expensive intermediate a
@@ -142,7 +139,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   exists: run a tiny probe of the solver's framework on each candidate device
   in the solver's interpreter (JAX: `python -c "import jax, jax.numpy as jnp;
   jax.config.update('jax_enable_x64', True); print(jax.devices(),
-  jnp.ones(3).sum())"`; check float64 if the solver needs it — DESC does).
+  jnp.ones(3).sum())"`; check float64 if the solver needs it).
   Only devices that pass are offered. Several JAX runs per GPU need
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` (or a smaller
   `XLA_CLIENT_MEM_FRACTION`) in the campaign's `env`, since JAX takes 75% of
@@ -156,7 +153,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 - **Experiment granularity (multi-step pipelines only)**: ask whether one
   experiment should be **one DB row** (simplest — one row per full pipeline run)
   or **one row per sub-step** (more plumbing, but lets the agent reuse an
-  expensive intermediate — e.g. a solved equilibrium — across downstream scans).
+  expensive intermediate — e.g. a solved first stage — across downstream scans).
   Per-step uses the `experiment_group` column to tie a parameter set's rows back
   together, plus an archival hook to thread the intermediate forward. Default to
   one-row-per-chain unless they want the reuse.
@@ -165,9 +162,9 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 
 1. **Adapter** (`adapters/<solver-slug>.py`) — implement the `contract.py`
    interface, modeling `adapters/toy.py`:
-   - `NAME`, `SOLVER_MODES` (the `--solver` choices; a single-shot solver has
-     one mode, a pipeline may expose several), `TARGET_FLAG` (the argparse
-     dest of the flag naming the target configuration, e.g. `"equilibrium"`),
+   - `NAME`, `MODES` (the `--mode` choices; a single-shot solver has one
+     mode, a pipeline may expose several), `TARGET_FLAG` (the argparse dest of
+     the flag naming the target configuration, e.g. `"case"`),
      `REQUIRED_ENV` / `OPTIONAL_ENV`, `EXECUTION_FLAGS` (dests that change how
      a run executes but not its result: timeout, threads, solver location),
      `SEED_FLAG` (the solver's RNG seed flag dest with default `None`, or
@@ -256,7 +253,7 @@ Print a short, practical summary:
   suggested batch size per planning interval, and which devices passed the
   probe.
 - **The first real launch command**, e.g.
-  `python run.py --campaign <slug> --solver <mode> --<target-flag> <case> [params]`.
+  `python run.py --campaign <slug> --mode <mode> --<target-flag> <case> [params]`.
 - **How to start the loop**: "Read `campaigns/<slug>/program.md`, then start
   the optimization loop."
 - Reminders: `LESSONS.md` is append-only memory; the program file is the

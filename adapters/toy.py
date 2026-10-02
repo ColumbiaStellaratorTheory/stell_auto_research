@@ -9,9 +9,8 @@ The shape to copy: register the solver's flags, fingerprint the solver code,
 run it with `contract.run_solver` in the run directory with a timeout, parse its results
 file, map native keys onto canonical metric keys, report what the run used
 (provenance) and what to keep (evidence), and classify the run — never raising
-for a solver failure. `examples/banana/simsopt_banana.py` shows the same
-contract for a real two-mode physics solver with a warm-start seed store and
-validation.
+for a solver failure. A pipeline adapter may expose several MODES and chain
+several run_solver calls in one run_experiment.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from contract import ExperimentOutcome, RunContext, run_solver
 # --- Contract surface -------------------------------------------------------
 
 NAME = "toy"
-SOLVER_MODES = ("optimize",)
+MODES = ("optimize",)
 TARGET_FLAG = "problem"
 REQUIRED_ENV = ()
 OPTIONAL_ENV = ()
@@ -109,7 +108,6 @@ def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutco
         "iterations": raw.get("evaluations"),
         "optimizer_success": raw.get("converged"),
         "objective_J": raw.get("objective"),
-        # no dedicated column → preserved in the metrics JSON overflow
         "distance_to_optimum": raw.get("distance_to_optimum"),
         "final_step": raw.get("final_step"),
     }

@@ -8,14 +8,17 @@ contract in `contract.py` before the core uses it.
 
 from __future__ import annotations
 
+import re
 from types import ModuleType
 
 from adapters import REGISTRY
 from contract import METRIC_GOALS
 
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 CONTRACT_MEMBERS = (
     "NAME",
-    "SOLVER_MODES",
+    "MODES",
     "TARGET_FLAG",
     "REQUIRED_ENV",
     "OPTIONAL_ENV",
@@ -48,6 +51,9 @@ def load_adapter(name: str, registry: dict[str, ModuleType] = REGISTRY) -> Modul
             f"adapter '{name}' does not implement the contract — missing "
             f"{', '.join(missing)} (see contract.py)."
         )
+    bad_names = [k for k in module.METRICS if not _IDENTIFIER.match(k)]
+    if bad_names:
+        raise AdapterError(f"adapter '{name}' METRICS keys must be snake_case identifiers: {bad_names}")
     bad_goals = {k: v for k, v in module.METRICS.items() if v not in METRIC_GOALS}
     if bad_goals:
         raise AdapterError(

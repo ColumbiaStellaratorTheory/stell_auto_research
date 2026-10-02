@@ -172,7 +172,7 @@ def mode_costs(runs: Sequence[Mapping], threads_flag: str | None) -> list[ModeCo
     """
     by_mode: dict[str, list[Mapping]] = {}
     for r in runs:
-        by_mode.setdefault(r["solver"], []).append(r)
+        by_mode.setdefault(r["mode"], []).append(r)
     costs = []
     for mode, group in sorted(by_mode.items()):
         finished = [r for r in group if r["status"] != "crash"] or group

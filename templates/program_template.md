@@ -31,7 +31,7 @@ not instruction. Treat it as a contract boundary, not a preset queue.
 
 {{SUCCESS_METRIC}}
 <!-- The one measurable claim that defines campaign success, plus how it is
-     verified (e.g. a Poincare validation tier, a target metric band). -->
+     verified (e.g. an independent validation verdict, a target metric band). -->
 
 ## Hard Invariants
 
@@ -51,13 +51,13 @@ here is a research variable.
    tried, the Pareto fronts, recent runs, crash causes and the noise floor.
 4. Start the loop.
 
-## Solver Modes
+## Modes
 
-The `--solver` flag selects a mode exposed by the solver adapter. Run
+The `--mode` flag selects a mode exposed by the solver adapter. Run
 `python run.py --campaign {{CAMPAIGN_SLUG}} --help` to see the modes and their flags.
 
-{{SOLVER_MODES}}
-<!-- Describe each --solver mode: what it optimizes, rough cost, when to use,
+{{MODES}}
+<!-- Describe each --mode: what it optimizes, rough cost, when to use,
      and any dependency between modes (one mode warm-starts from another's
      output; a single experiment runs a multi-step pipeline; etc.). Note solver
      quirks and known failure modes. Delete guidance that doesn't apply yet —
@@ -74,7 +74,7 @@ source directly is encouraged when a metric or crash is ambiguous.)
 python run.py --campaign {{CAMPAIGN_SLUG}} --{{TARGET_FLAG}} {{EXAMPLE_TARGET}} [params]
 
 # A specific mode
-python run.py --campaign {{CAMPAIGN_SLUG}} --solver {{EXAMPLE_SOLVER_MODE}} --{{TARGET_FLAG}} {{EXAMPLE_TARGET}} \
+python run.py --campaign {{CAMPAIGN_SLUG}} --mode {{EXAMPLE_MODE}} --{{TARGET_FLAG}} {{EXAMPLE_TARGET}} \
     {{EXAMPLE_MODE_PARAMS}} --timeout {{EXAMPLE_TIMEOUT}}
 ```
 
@@ -104,12 +104,12 @@ constraints.
 Enforced limits — do not go below/above:
 
 {{CONSTRAINT_FLOORS}}
-<!-- e.g. curvature_threshold >= X, cc_dist >= Y m, length_target >= Z m.
-     These come from your hardware/buildability contract. -->
+<!-- e.g. a minimum spacing, a maximum curvature, a resolution ceiling.
+     These come from the user's hardware/buildability or validity contract. -->
 
 ## Target Configurations (`--{{TARGET_FLAG}}`)
 
-{{EQUILIBRIA_TABLE}}
+{{TARGETS_TABLE}}
 <!-- Table of available target configurations the adapter resolves: registry
      key or filename, plus the properties that matter for this campaign and
      provenance. The target flag accepts whatever the adapter's resolver accepts. -->
@@ -150,28 +150,17 @@ modify the database.
 ### Schema
 
 ```
-runs(
-  id, coil_type, solver, equilibrium, experiment_group,
-  spec_hash, replicate, seed, parent_run_id, replay_of,
-  status, status_reason, crash_signature, validated,
-  iterations, elapsed, created_at, optimizer_success, termination_message,
-  field_error, qs_error, boozer_residual,
-  iota_actual, volume_actual,
-  max_curvature,
-  coil_length, coil_coil_dist, coil_surface_dist, surface_vessel_dist,
-  max_force, self_intersecting, objective_J,
-  metrics,  -- JSON: solver-specific metrics with no column; json_extract(metrics, '$.key')
-  params,   -- JSON: every flag of the run, defaults included; json_extract(params, '$.key')
-  provenance, -- JSON: solver identity/commit, command, input hashes, harness commit, platform
-  evidence  -- JSON: kept files (name -> sha256) under blobs/
-)
+{{SCHEMA}}
 ```
+<!-- Paste the output of `python run.py schema --campaign {{CAMPAIGN_SLUG}}`. -->
 
-`coil_type` = the solver family; `equilibrium` = the value of the target flag
-(`--{{TARGET_FLAG}}`); `experiment_group` ties together rows of one
-multi-step experiment (NULL when one experiment is one row). Metrics with a
-dedicated column above are common across solvers; anything specific to this
-solver is preserved in the `metrics` JSON blob.
+Query the `results` view: the `runs` columns plus one column per metric
+(`SELECT target, objective_J FROM results ...`). `runs` holds the same rows
+with metrics as JSON, plus `params` (every flag of the run;
+`json_extract(params, '$.key')`), `provenance` and `evidence`. `adapter` = the
+solver family; `target` = the value of the target flag (`--{{TARGET_FLAG}}`);
+`experiment_group` ties together rows of one multi-step experiment (NULL when
+one experiment is one row).
 
 ### Query Notes
 
@@ -181,8 +170,8 @@ Hard-won defaults, not rules — override them when you have a reason:
   query `params` to see what neighbouring configs were tried:
   ```sql
   SELECT COUNT(*) FROM runs
-  WHERE equilibrium = '...' AND solver = '...'
-  AND json_extract(params, '$.cc_weight') = ...;
+  WHERE target = '...' AND mode = '...'
+  AND json_extract(params, '$.<flag>') = ...;
   ```
 - Replicates of one spec differ only in `replicate` and the derived `seed`;
   their spread is the noise floor for comparing configs. `parent_run_id`
@@ -242,8 +231,9 @@ suggests a better way to spend the next experiment:
 
 {{AUTONOMY_POLICY}}
 <!-- Pick one and delete the other:
-     "**NEVER STOP.** If stuck on one solver/equilibrium, switch. If weights
-      plateau, change geometry. Keep going until the human interrupts you."
+     "**NEVER STOP.** If stuck on one mode/target, switch. If one family of
+      parameters plateaus, change another. Keep going until the human
+      interrupts you."
      — or a bounded policy, e.g. "Run N experiments per session, then write
       a summary and stop." -->
 

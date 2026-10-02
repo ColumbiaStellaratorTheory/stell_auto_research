@@ -164,11 +164,11 @@ class TestLoadAdapter(unittest.TestCase):
         self.assertIs(adapter.load_adapter("toy"), toy)
 
     def test_unknown_adapter_lists_installed_ones(self):
-        with self.assertRaisesRegex(adapter.AdapterError, r"no adapter 'nope'.*installed: simsopt_banana, toy"):
+        with self.assertRaisesRegex(adapter.AdapterError, r"no adapter 'nope'.*installed: toy"):
             adapter.load_adapter("nope")
 
     def test_incomplete_adapter_names_missing_members(self):
-        incomplete = types.SimpleNamespace(NAME="x", SOLVER_MODES=("m",))
+        incomplete = types.SimpleNamespace(NAME="x", MODES=("m",))
         with self.assertRaisesRegex(adapter.AdapterError, "missing TARGET_FLAG, REQUIRED_ENV"):
             adapter.load_adapter("x", {"x": incomplete})
 
@@ -185,7 +185,7 @@ class TestRunSpec(unittest.TestCase):
         spec = run.run_spec(_toy_args(dim=4))
         self.assertNotIn("campaign", spec)
         self.assertNotIn("replicate", spec)
-        self.assertEqual((spec["dim"], spec["solver"], spec["timeout"]), (4, "optimize", 60))
+        self.assertEqual((spec["dim"], spec["mode"], spec["timeout"]), (4, "optimize", 60))
 
     def test_execution_flags_do_not_change_the_hash(self):
         a = run.spec_hash(toy, run.run_spec(_toy_args(timeout=60)), "v1")
@@ -236,8 +236,8 @@ class TestBuildRecord(unittest.TestCase):
     def test_identity_fields(self):
         record = self._record(contract.ExperimentOutcome("pass", "ok", parent_run_id="p0"))
         self.assertEqual(
-            {k: record[k] for k in ("id", "coil_type", "equilibrium", "spec_hash", "replicate", "seed", "parent_run_id")},
-            {"id": "r1", "coil_type": "toy", "equilibrium": "rastrigin", "spec_hash": "h1",
+            {k: record[k] for k in ("id", "adapter", "target", "spec_hash", "replicate", "seed", "parent_run_id")},
+            {"id": "r1", "adapter": "toy", "target": "rastrigin", "spec_hash": "h1",
              "replicate": 0, "seed": 7, "parent_run_id": "p0"},
         )
 
@@ -245,12 +245,13 @@ class TestBuildRecord(unittest.TestCase):
         record = self._record(contract.ExperimentOutcome(
             "pass", "ok", metrics={"objective_J": 0.5, "distance_to_optimum": 0.1}
         ))
-        self.assertEqual((record["objective_J"], record["metrics"]), (0.5, {"distance_to_optimum": 0.1}))
+        self.assertEqual(record["metrics"], {"objective_J": 0.5, "distance_to_optimum": 0.1})
+        self.assertNotIn("objective_J", record, "metrics live only in the metrics field")
 
     def test_nan_metric_and_nan_param_are_cleaned_to_none(self):
         outcome = contract.ExperimentOutcome("fail", "incomplete_metrics", metrics={"objective_J": float("nan")})
         record = self._record(outcome, noise=float("nan"))
-        self.assertIsNone(record["objective_J"])
+        self.assertIsNone(record["metrics"]["objective_J"])
         self.assertIsNone(record["params"]["noise"])
 
     def test_provenance_combines_solver_adapter_harness_and_platform(self):
@@ -263,7 +264,7 @@ class TestBuildRecord(unittest.TestCase):
     def test_summary_is_compact(self):
         record = self._record(contract.ExperimentOutcome("pass", "ok", metrics={"objective_J": 0.5}))
         printed = run.summary(record, on_front=True)
-        self.assertFalse({"provenance", "evidence", "params", "spec_hash", "field_error"} & set(printed))
+        self.assertFalse({"provenance", "evidence", "params", "spec_hash"} & set(printed))
         self.assertEqual((printed["metrics"], printed["on_front"]), ({"objective_J": 0.5}, True))
 
     def test_summary_carries_crash_signature_and_omits_on_front_for_non_pass(self):
@@ -303,10 +304,10 @@ class TestRebuild(_ScratchDirTest):
 
     def _record(self, rid: str, created: str) -> dict:
         return {
-            "id": rid, "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
+            "id": rid, "adapter": "toy", "mode": "optimize", "target": "sphere",
             "status": "pass", "status_reason": "ok", "created_at": created,
-            "spec_hash": "h", "replicate": 0, "objective_J": 1.5,
-            "params": {"dim": 2}, "metrics": {}, "provenance": {}, "evidence": {},
+            "spec_hash": "h", "replicate": 0,
+            "params": {"dim": 2}, "metrics": {"objective_J": 1.5}, "provenance": {}, "evidence": {},
         }
 
     def test_rebuild_indexes_every_run_and_writes_jsonl(self):
@@ -315,7 +316,7 @@ class TestRebuild(_ScratchDirTest):
             run.write_run_record(layout.runs_dir, self._record(rid, created))
         self.assertEqual(run.rebuild(layout), 2)
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
-            rows = db.execute("SELECT id, objective_J FROM runs ORDER BY id").fetchall()
+            rows = db.execute("SELECT id, json_extract(metrics, '$.objective_J') FROM runs ORDER BY id").fetchall()
         self.assertEqual(rows, [("r1", 1.5), ("r2", 1.5)])
         jsonl_ids = [json.loads(line)["id"] for line in layout.jsonl_path.read_text().splitlines()]
         self.assertEqual(jsonl_ids, ["r1", "r2"])
@@ -348,7 +349,7 @@ class TestCompareRuns(unittest.TestCase):
     """A replay matches when status agrees and every metric is within the relative tolerance."""
 
     def _rec(self, status="pass", **metrics) -> dict:
-        return {"status": status, "objective_J": metrics.pop("objective_J", 1.0), "metrics": metrics}
+        return {"status": status, "metrics": {"objective_J": metrics.pop("objective_J", 1.0), **metrics}}
 
     def test_identical_runs_match(self):
         self.assertEqual(run.compare_runs(self._rec(final_step=0.5), self._rec(final_step=0.5), 0.0), [])
@@ -373,11 +374,11 @@ class TestExecute(_ScratchDirTest):
             NAME="broken", TARGET_FLAG="problem", SEED_FLAG=None, EXECUTION_FLAGS=(),
             run_experiment=lambda _a, _r: 1 / 0,
         )
-        args = argparse.Namespace(campaign="c", replicate=0, solver="optimize", problem="sphere", dim=3)
+        args = argparse.Namespace(campaign="c", replicate=0, mode="optimize", problem="sphere", dim=3)
         record = run.execute(broken, self._layout(), args, "v0")
         self.assertEqual(record["status"], "crash")
         self.assertTrue(record["status_reason"].startswith("adapter_error"), record["status_reason"])
-        self.assertEqual(record["params"], {"solver": "optimize", "problem": "sphere", "dim": 3})
+        self.assertEqual(record["params"], {"mode": "optimize", "problem": "sphere", "dim": 3})
         self.assertTrue((self.root / "runs" / f"{record['id']}.json").exists())
 
     def test_pass_policy_keeps_passing_run(self):
@@ -433,7 +434,7 @@ class TestEndToEnd(_CliTest):
 
     def test_passing_run_is_recorded_as_file_and_db_row(self):
         printed = self._json("--problem", "sphere", "--dim", "3", "--maxiter", "500")
-        self.assertEqual((printed["status"], printed["equilibrium"]), ("pass", "sphere"))
+        self.assertEqual((printed["status"], printed["target"]), ("pass", "sphere"))
         self.assertNotIn("provenance", printed, "stdout should stay compact")
         record = json.loads((self.demo / "runs" / f"{printed['id']}.json").read_text())
         self.assertEqual(record["provenance"]["adapter"]["command"][2:4], ["--problem", "sphere"])
@@ -481,7 +482,7 @@ class TestEndToEnd(_CliTest):
         original = self._json("--problem", "sphere", "--maxiter", "100")
         path = self.demo / "runs" / f"{original['id']}.json"
         tampered = json.loads(path.read_text())
-        tampered["objective_J"] = 123.0
+        tampered["metrics"]["objective_J"] = 123.0
         path.write_text(json.dumps(tampered))
         proc = self._run("replay", original["id"])
         self.assertEqual(proc.returncode, run.REPLAY_MISMATCH_EXIT, proc.stderr)
@@ -508,16 +509,21 @@ class TestEndToEnd(_CliTest):
         self.assertTrue((kept / "artifacts" / run_id / "results.json").exists())
 
     def test_missing_required_env_stops_before_running(self):
-        banana = _make_campaign(self.campaigns, "banana", {"adapter": "simsopt_banana"})
-        env_free = {k: v for k, v in os.environ.items() if k not in ("SIMSOPT_ROOT", "SIMSOPT_PYTHON", "EQUILIBRIA_DIR")}
-        proc = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "run.py"), "--campaign", "banana"],
-            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
-            env={**env_free, run.CAMPAIGNS_DIR_ENV: str(self.campaigns)},
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("needs SIMSOPT_ROOT, SIMSOPT_PYTHON, EQUILIBRIA_DIR", proc.stderr)
-        self.assertFalse((banana / "runs").exists())
+        needy = types.ModuleType("needy")
+        needy.__dict__.update({k: getattr(toy, k) for k in adapter.CONTRACT_MEMBERS})
+        needy.NAME, needy.REQUIRED_ENV = "needy", ("NEEDY_SOLVER_ROOT",)
+        self.addCleanup(adapter.REGISTRY.pop, "needy", None)
+        adapter.REGISTRY["needy"] = needy
+        campaign = _make_campaign(self.campaigns, "needy", {"adapter": "needy"})
+        environ = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine")}
+        environ.pop("NEEDY_SOLVER_ROOT", None)
+        original = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+        os.environ.clear()
+        os.environ.update(environ)
+        with self.assertRaisesRegex(run.HarnessError, "needs NEEDY_SOLVER_ROOT"):
+            run._dispatch("run", ["--campaign", "needy"])
+        self.assertFalse((campaign / "runs").exists())
 
     def test_unknown_adapter_exits_with_message(self):
         _make_campaign(self.campaigns, "broken", {"adapter": "nope"})
@@ -541,7 +547,11 @@ class TestSchemaUpgrade(_ScratchDirTest):
             db.execute("PRAGMA user_version = 2")
         with contextlib.closing(run.open_db(layout)) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
-            self.assertEqual(db.execute("SELECT id, crash_signature FROM runs").fetchall(), [("r1", None)])
+            self.assertEqual(
+                db.execute("SELECT id, adapter, mode, target FROM runs").fetchall(),
+                [("r1", "toy", "optimize", "sphere")],
+                "old run files are converted to the current names on rebuild",
+            )
 
 
 class TestSpecBase(unittest.TestCase):
@@ -571,26 +581,26 @@ class TestQueryAndLessons(_ScratchDirTest):
         layout = self._layout()
         for i in range(n):
             run.write_run_record(layout.runs_dir, {
-                "id": f"r{i}", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
+                "id": f"r{i}", "adapter": "toy", "mode": "optimize", "target": "sphere",
                 "status": "pass", "status_reason": "ok", "created_at": f"2026-01-{i + 1:02d}",
-                "objective_J": float(i),
+                "metrics": {"objective_J": float(i)},
             })
         run.rebuild(layout)
         return layout
 
     def test_query_returns_header_and_rows(self):
-        out = run.query(self._layout_with_runs(2), "SELECT id, objective_J FROM runs ORDER BY id", 10)
+        out = run.query(self._layout_with_runs(2), toy, "SELECT id, objective_J FROM results ORDER BY id", 10)
         self.assertEqual(out.splitlines(), ["id\tobjective_J", "r0\t0", "r1\t1"])
 
     def test_query_is_capped(self):
-        out = run.query(self._layout_with_runs(5), "SELECT id FROM runs", 2)
+        out = run.query(self._layout_with_runs(5), toy, "SELECT id FROM runs", 2)
         self.assertEqual(len(out.splitlines()), 4)
         self.assertIn("more than 2 rows", out)
 
     def test_query_cannot_write(self):
         layout = self._layout_with_runs(1)
         with self.assertRaisesRegex(run.HarnessError, "readonly"):
-            run.query(layout, "DELETE FROM runs", 10)
+            run.query(layout, toy, "DELETE FROM runs", 10)
 
     def test_import_lessons_demotes_headings_under_one_marked_entry(self):
         source, target = self.root / "src", self.root / "dst"
@@ -799,6 +809,47 @@ class TestMachineEndToEnd(_CliTest):
         brief = self._run("brief").stdout
         self.assertIn("machine: 4 run slots", brief)
         self.assertIn("batch ≤", brief)
+
+
+
+class TestGenericSchema(_ScratchDirTest):
+    """Metrics live in JSON; the results view gives each declared metric a column."""
+
+    def test_legacy_record_is_upgraded(self):
+        old = {"id": "r", "coil_type": "banana", "solver": "stage2", "equilibrium": "nfp5",
+               "field_error": 0.01, "objective_J": None, "metrics": {"lead_end_curvature": 3.0},
+               "params": {"solver": "stage2", "cc_weight": 10}, "status": "pass"}
+        new = run.upgrade_record(old)
+        self.assertEqual((new["adapter"], new["mode"], new["target"]), ("banana", "stage2", "nfp5"))
+        self.assertEqual(new["metrics"], {"field_error": 0.01, "lead_end_curvature": 3.0})
+        self.assertEqual(new["params"], {"mode": "stage2", "cc_weight": 10})
+        self.assertNotIn("field_error", new)
+        self.assertEqual(run.upgrade_record(new), new, "current records pass through unchanged")
+
+    def test_results_view_has_one_column_per_metric(self):
+        layout = self._layout()
+        run.write_run_record(layout.runs_dir, {
+            "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
+            "created_at": "2026-01-01", "metrics": {"objective_J": 0.25, "optimizer_success": True},
+        })
+        run.rebuild(layout)
+        out = run.query(layout, toy, "SELECT objective_J, optimizer_success, final_step FROM results", 5)
+        self.assertEqual(out.splitlines(), ["objective_J\toptimizer_success\tfinal_step", "0.25\t1\t"])
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
+            indexes = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertTrue({"idx_metric_objective_J", "idx_metric_distance_to_optimum"} <= indexes)
+
+    def test_metric_names_must_be_identifiers(self):
+        bad = types.SimpleNamespace(**{m: getattr(toy, m) for m in adapter.CONTRACT_MEMBERS})
+        bad.METRICS = {"field error": "min"}
+        with self.assertRaisesRegex(adapter.AdapterError, "snake_case identifiers"):
+            adapter.load_adapter("bad", {"bad": bad})
+
+    def test_metric_named_like_a_run_column_is_refused(self):
+        layout = self._layout()
+        clash = types.SimpleNamespace(NAME="clash", METRICS={"status": None})
+        with self.assertRaisesRegex(run.HarnessError, "reuse run column names"):
+            run.ensure_results_view(layout, clash)
 
 
 if __name__ == "__main__":

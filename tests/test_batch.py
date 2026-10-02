@@ -95,7 +95,7 @@ class TestPromotion(unittest.TestCase):
 
     def _stage(self, by: str, top: int = 2) -> batch.Stage:
         raw = _batch({"name": "screen"}, {"name": "confirm", "from": "screen", "select": {"top": top, "by": by},
-                                          "base": {"solver": "full"}, "carry": ["w"], "replicates": 2})
+                                          "base": {"mode": "full"}, "carry": ["w"], "replicates": 2})
         return batch.parse_batch(raw, GOALS).stages[1]
 
     def test_ranks_by_metric_goal(self):
@@ -110,7 +110,7 @@ class TestPromotion(unittest.TestCase):
     def test_carried_params_and_parent(self):
         planned = batch.plan_promotion(self._stage("error"), [_view("a", error=1.0)], {"a": {"w": 7, "other": 1}})
         self.assertEqual([(dict(p.spec), p.replicate, p.parent_run_id) for p in planned],
-                         [({"solver": "full", "w": 7}, 0, "a"), ({"solver": "full", "w": 7}, 1, "a")])
+                         [({"mode": "full", "w": 7}, 0, "a"), ({"mode": "full", "w": 7}, 1, "a")])
 
 
 class TestEarlyStop(unittest.TestCase):

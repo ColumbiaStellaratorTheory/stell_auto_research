@@ -18,7 +18,7 @@ import machine
 
 def _run(mode: str, elapsed: float, peak: float | None, status: str = "pass", threads: int | None = None) -> dict:
     params = {"omp_threads": threads} if threads is not None else {}
-    return {"solver": mode, "status": status, "elapsed": elapsed, "peak_rss_mb": peak, "params": params}
+    return {"mode": mode, "status": status, "elapsed": elapsed, "peak_rss_mb": peak, "params": params}
 
 
 class TestSizing(unittest.TestCase):
@@ -43,12 +43,12 @@ class TestModeCosts(unittest.TestCase):
 
     def test_median_time_max_memory_common_threads(self):
         runs = [
-            _run("stage2", 30, 1000, threads=10), _run("stage2", 40, 2048, threads=10),
-            _run("stage2", 2, 50, status="crash", threads=10), _run("full", 900, 4096, threads=4),
+            _run("screen", 30, 1000, threads=10), _run("screen", 40, 2048, threads=10),
+            _run("screen", 2, 50, status="crash", threads=10), _run("full", 900, 4096, threads=4),
         ]
         costs = {c.mode: c for c in machine.mode_costs(runs, "omp_threads")}
-        self.assertEqual((costs["stage2"].runs, costs["stage2"].median_seconds, costs["stage2"].threads), (2, 35, 10))
-        self.assertAlmostEqual(costs["stage2"].peak_memory_gb, 2.0)
+        self.assertEqual((costs["screen"].runs, costs["screen"].median_seconds, costs["screen"].threads), (2, 35, 10))
+        self.assertAlmostEqual(costs["screen"].peak_memory_gb, 2.0)
         self.assertEqual(costs["full"].threads, 4)
 
     def test_single_threaded_adapter_and_unknown_memory(self):

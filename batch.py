@@ -8,15 +8,15 @@ A batch file is JSON written by the agent once per planning step:
       "early_stop": {"same_crash": 3},
       "stages": [
         {"name": "screen",
-         "base": {"solver": "stage2", "equilibrium": "nfp5_iota17"},
-         "runs": [{"cc_weight": 50}],                         # explicit specs
-         "grid": {"order": [2, 3]},                           # cartesian product
-         "halton": {"n": 16, "ranges": {"cc_weight": [10, 1000, "log"]}},
+         "base": {"mode": "fast", "problem": "rastrigin"},
+         "runs": [{"step_size": 0.05}],                       # explicit specs
+         "grid": {"dim": [2, 3]},                             # cartesian product
+         "halton": {"n": 16, "ranges": {"step_size": [0.01, 1.0, "log"]}},
          "lhs": {"n": 8, "seed": 0, "ranges": {"maxiter": [100, 400, "int"]}},
          "replicates": 2},
         {"name": "confirm", "from": "screen",
-         "select": {"top": 3, "by": "field_error"},           # or "by": "front"
-         "base": {"solver": "single-stage"}, "carry": ["cc_weight"]}
+         "select": {"top": 3, "by": "objective_J"},           # or "by": "front"
+         "base": {"mode": "full"}, "carry": ["step_size", "dim"]}
       ]
     }
 

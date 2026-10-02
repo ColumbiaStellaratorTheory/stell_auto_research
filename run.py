@@ -57,7 +57,7 @@ from locks import acquire_slot, release, report_waiting, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # From this version on every DB row has a run file, so an older DB can be
 # rebuilt from runs/ without losing anything.
 FIRST_RECORD_BACKED_VERSION = 2
@@ -83,42 +83,32 @@ CORE_FLAGS = ("campaign", "replicate", "batch_id", "parent_run_id")
 DEDUPE_STATUSES = ("pass", "fail")
 REPLAY_MISMATCH_EXIT = 2
 
-# Canonical metric keys with a dedicated DB column (must match schema.sql). Any
-# other key an adapter emits is preserved in the row's `metrics` JSON blob.
-COLUMN_METRIC_KEYS = (
-    "iterations",
-    "optimizer_success",
-    "termination_message",
-    "field_error",
-    "qs_error",
-    "boozer_residual",
-    "iota_actual",
-    "volume_actual",
-    "max_curvature",
-    "coil_length",
-    "coil_coil_dist",
-    "coil_surface_dist",
-    "surface_vessel_dist",
-    "max_force",
-    "self_intersecting",
-    "objective_J",
-)
 IDENTITY_COLUMNS = (
-    "id", "coil_type", "solver", "equilibrium", "experiment_group",
+    "id", "adapter", "mode", "target", "experiment_group",
     "spec_hash", "replicate", "seed", "parent_run_id", "replay_of", "batch_id",
     "status", "status_reason", "crash_signature", "validated", "elapsed", "peak_rss_mb", "created_at",
 )
 JSON_COLUMNS = ("metrics", "params", "provenance", "evidence")
-BOOL_COLUMNS = ("optimizer_success", "self_intersecting")
-DB_COLUMNS = IDENTITY_COLUMNS + COLUMN_METRIC_KEYS + JSON_COLUMNS
+DB_COLUMNS = IDENTITY_COLUMNS + JSON_COLUMNS
+# The view that turns each of the adapter's METRICS into a column.
+RESULTS_VIEW = "results"
+# Run records written before schema v6 used stellarator-specific names and
+# kept some metrics as top-level fields; upgrade_record converts them.
+LEGACY_RENAMES = {"coil_type": "adapter", "solver": "mode", "equilibrium": "target"}
+LEGACY_METRIC_FIELDS = (
+    "iterations", "optimizer_success", "termination_message", "field_error", "qs_error",
+    "boozer_residual", "iota_actual", "volume_actual", "max_curvature", "coil_length",
+    "coil_coil_dist", "coil_surface_dist", "surface_vessel_dist", "max_force",
+    "self_intersecting", "objective_J",
+)
 # Identity fields shown in the stdout summary when set; metrics follow.
 SUMMARY_FIELDS = (
-    "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
+    "id", "mode", "target", "status", "status_reason", "crash_signature",
     "validated", "parent_run_id", "replay_of", "batch_id", "replicate", "seed", "elapsed",
 )
 # Run fields the analysis views carry besides metric values.
 VIEW_FIELDS = (
-    "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
+    "id", "mode", "target", "status", "status_reason", "crash_signature",
     "validated", "created_at", "replicate", "seed", "elapsed", "peak_rss_mb",
 )
 
@@ -345,14 +335,6 @@ def _uuid7() -> str:
     return str(uuid.UUID(int=u))
 
 
-def _bool_to_int(v: object) -> int | None:
-    if v is True:
-        return 1
-    if v is False:
-        return 0
-    return None
-
-
 def _canonical_hash(payload: object) -> str:
     """SHA-256 of `payload` as canonical JSON (sorted keys, no whitespace)."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -471,17 +453,37 @@ def write_run_record(runs_dir: Path, record: Mapping[str, object]) -> Path:
 
 def read_run_records(runs_dir: Path) -> list[dict]:
     """Every run record, ordered by (created_at, id)."""
-    records = [json.loads(p.read_text()) for p in runs_dir.glob("*.json")]
+    records = [upgrade_record(json.loads(p.read_text())) for p in runs_dir.glob("*.json")]
     return sorted(records, key=lambda r: (r.get("created_at") or "", r["id"]))
+
+
+def upgrade_record(record: Mapping[str, object]) -> dict:
+    """A run record in the current shape; records from before schema v6 are converted.
+
+    Old records named the adapter, mode and target `coil_type`, `solver` and
+    `equilibrium`, and kept some metrics as top-level fields. Run files are
+    never rewritten; they are converted whenever they are read.
+    """
+    if "coil_type" not in record:
+        return dict(record)
+    renamed = {new: record.get(old) for old, new in LEGACY_RENAMES.items()}
+    metrics = {k: record[k] for k in LEGACY_METRIC_FIELDS if record.get(k) is not None}
+    metrics.update(record.get("metrics") or {})
+    params = dict(record.get("params") or {})
+    if "solver" in params and "mode" not in params:
+        params["mode"] = params.pop("solver")
+    rest = {
+        k: v for k, v in record.items()
+        if k not in LEGACY_RENAMES and k not in LEGACY_METRIC_FIELDS and k not in ("metrics", "params")
+    }
+    return {**rest, **renamed, "metrics": metrics, "params": params}
 
 
 def _db_row(record: Mapping[str, object]) -> dict:
     row = {}
     for column in DB_COLUMNS:
         value = record.get(column)
-        if column in BOOL_COLUMNS:
-            value = _bool_to_int(value)
-        elif column in JSON_COLUMNS:
+        if column in JSON_COLUMNS:
             value = json.dumps(value if value is not None else {})
         row[column] = value
     return row
@@ -565,15 +567,8 @@ def index_record(layout: Layout, record: Mapping[str, object]) -> None:
 
 
 def _legacy_record(raw: dict, source: Path) -> dict:
-    """A results.jsonl record from an older harness, given the current record fields."""
-    record = {column: raw.get(column) for column in IDENTITY_COLUMNS + COLUMN_METRIC_KEYS}
-    record.update({
-        "metrics": raw.get("metrics") or {},
-        "params": raw.get("params") or {},
-        "provenance": {"imported_from": str(source)},
-        "evidence": {},
-    })
-    return record
+    """A results.jsonl record from an older harness, in the current record shape."""
+    return {**upgrade_record(raw), "provenance": {"imported_from": str(source)}, "evidence": {}}
 
 
 def import_jsonl(layout: Layout, source: Path) -> int:
@@ -632,17 +627,13 @@ def _build_record(
     crash_signature: str | None = None,
     replay_of: str | None = None,
 ) -> dict:
-    """Assemble a run record from an adapter outcome. NaN cleaning happens here.
-
-    Canonical metric keys with a column are projected to top-level fields; every
-    other emitted key is preserved (cleaned) in `metrics` for JSON storage.
-    """
+    """Assemble a run record from an adapter outcome. NaN cleaning happens here."""
     metrics = outcome.metrics
     record = {
         "id": run_id,
-        "coil_type": active.NAME,
-        "solver": args.solver,
-        "equilibrium": getattr(args, active.TARGET_FLAG),
+        "adapter": active.NAME,
+        "mode": args.mode,
+        "target": getattr(args, active.TARGET_FLAG),
         "experiment_group": outcome.experiment_group,
         "spec_hash": digest,
         "replicate": args.replicate,
@@ -658,11 +649,7 @@ def _build_record(
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "params": run_spec(args),
     }
-    for key in COLUMN_METRIC_KEYS:
-        record[key] = clean(metrics.get(key))
-    record["metrics"] = {
-        k: clean(v) for k, v in metrics.items() if k not in COLUMN_METRIC_KEYS
-    }
+    record["metrics"] = {k: clean(v) for k, v in metrics.items()}
     record["provenance"] = {
         "solver_identity": solver_identity,
         "adapter": dict(outcome.provenance),
@@ -674,10 +661,8 @@ def _build_record(
 
 
 def metric_values(record: Mapping[str, object]) -> dict:
-    """Every non-null metric of a record: column metrics plus the JSON overflow."""
-    values = {k: record.get(k) for k in COLUMN_METRIC_KEYS}
-    values.update(record.get("metrics") or {})
-    return {k: v for k, v in values.items() if v is not None}
+    """Every non-null metric of a record."""
+    return {k: v for k, v in (record.get("metrics") or {}).items() if v is not None}
 
 
 def summary(record: Mapping[str, object], on_front: bool | None) -> dict:
@@ -698,7 +683,7 @@ def summary(record: Mapping[str, object], on_front: bool | None) -> dict:
 
 def _read_views(db: sqlite3.Connection, active: ModuleType) -> list[dict]:
     db.row_factory = sqlite3.Row
-    columns = ", ".join(VIEW_FIELDS + COLUMN_METRIC_KEYS + ("metrics", "params"))
+    columns = ", ".join(VIEW_FIELDS + ("metrics", "params"))
     views = []
     for row in db.execute(f"SELECT {columns} FROM runs"):
         record = dict(row)
@@ -766,7 +751,7 @@ def execute(
         # experiment stays reproducible.
         print(f"WARNING: adapter raised: {e}", file=sys.stderr)
         outcome = ExperimentOutcome("crash", f"adapter_error: {e}")
-    # Total experiment wall time: includes any validation (e.g. Poincaré) or
+    # Total experiment wall time: includes any validation or
     # chained sub-steps the adapter runs internally, not just one solver call.
     elapsed = time.monotonic() - t0
     peak_rss_mb = machine.children_peak_rss_mb()
@@ -862,7 +847,7 @@ def replay(active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, 
     path = layout.runs_dir / f"{run_id}.json"
     if not path.exists():
         raise HarnessError(f"no run record {path}")
-    original = json.loads(path.read_text())
+    original = upgrade_record(json.loads(path.read_text()))
     defaults = vars(parser.parse_args([]))
     values = {**defaults, **original["params"], "replicate": original.get("replicate") or 0}
     args = with_seed(active, argparse.Namespace(**values))
@@ -961,7 +946,7 @@ def schema_report(active: ModuleType, campaign: str) -> str:
     recorded = ", ".join(m for m, g in active.METRICS.items() if not g)
     return "\n".join([
         f"runs({', '.join(DB_COLUMNS)})",
-        f"metric columns: {', '.join(COLUMN_METRIC_KEYS)}; other metrics: json_extract(metrics, '$.key')",
+        f"{RESULTS_VIEW}({', '.join(IDENTITY_COLUMNS + tuple(active.METRICS))}): runs with one column per metric",
         f"goals: {goals or 'none'}",
         f"recorded only: {recorded or 'none'}",
         f"flags: python run.py --campaign {campaign} --help",
@@ -974,12 +959,37 @@ def _cell(value: object) -> str:
     return text if len(text) <= QUERY_CELL_CHARS else text[: QUERY_CELL_CHARS - 1] + "…"
 
 
-def query(layout: Layout, sql: str, limit: int) -> str:
-    """Run one read-only SQL statement; return tab-separated rows (header first), capped."""
+def ensure_results_view(layout: Layout, active: ModuleType) -> None:
+    """(Re)create the `results` view — runs plus one column per METRICS key — and goal indexes.
+
+    Rebuilt each time it is needed, so it always matches the adapter's
+    current METRICS. Goal metrics get expression indexes for fast ORDER BY.
+    """
+    clashes = sorted(set(active.METRICS) & set(DB_COLUMNS))
+    if clashes:
+        raise HarnessError(f"adapter '{active.NAME}' METRICS reuse run column names: {clashes}")
+    columns = ", ".join(
+        [*IDENTITY_COLUMNS, *(f"json_extract(metrics, '$.{m}') AS {m}" for m in active.METRICS)]
+    )
+    indexes = "".join(
+        f"CREATE INDEX IF NOT EXISTS idx_metric_{m} ON runs(json_extract(metrics, '$.{m}'));\n"
+        for m, goal in active.METRICS.items() if goal
+    )
+    with contextlib.closing(open_db(layout)) as db:
+        db.executescript(
+            f"BEGIN IMMEDIATE;\nDROP VIEW IF EXISTS {RESULTS_VIEW};\n"
+            f"CREATE VIEW {RESULTS_VIEW} AS SELECT {columns} FROM runs;\n{indexes}COMMIT;"
+        )
+
+
+def query(layout: Layout, active: ModuleType, sql: str, limit: int) -> str:
+    """Run one read-only SQL statement; return tab-separated rows (header first), capped.
+
+    The `results` view (runs plus one column per metric) is refreshed first.
+    """
     if not layout.db_path.exists():
         raise HarnessError(f"no {layout.db_path} yet: run an experiment first")
-    with contextlib.closing(open_db(layout)):
-        pass  # creates or upgrades the schema before the read-only connection
+    ensure_results_view(layout, active)
     uri = f"{layout.db_path.resolve().as_uri()}?mode=ro"
     try:
         with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
@@ -1131,13 +1141,13 @@ def _result_view(record: Mapping[str, object]) -> dict:
     """A run's record as an analysis view (enough for promotion and the summary)."""
     return {
         "id": record["id"], "status": record["status"], "status_reason": record.get("status_reason"),
-        "crash_signature": record.get("crash_signature"), "equilibrium": record.get("equilibrium"),
-        "solver": record.get("solver"), "values": metric_values(record),
+        "crash_signature": record.get("crash_signature"), "target": record.get("target"),
+        "mode": record.get("mode"), "values": metric_values(record),
     }
 
 
 def _read_record(layout: Layout, run_id: str) -> dict:
-    return json.loads((layout.runs_dir / f"{run_id}.json").read_text())
+    return upgrade_record(json.loads((layout.runs_dir / f"{run_id}.json").read_text()))
 
 
 def launch_runs(
@@ -1197,7 +1207,7 @@ def _summary_lines(stage: str, results: list[dict], metric_goals: Mapping[str, s
     front = analysis.pareto_front(results, goals)
     for r in front[:BATCH_SUMMARY_ROWS]:
         values = " ".join(f"{m}={analysis.fmt(r['values'][m])}" for m, _ in goals)
-        lines.append(f"  front {r['id']} {r['solver']}/{r['equilibrium']} {values}")
+        lines.append(f"  front {r['id']} {r['mode']}/{r['target']} {values}")
     causes = Counter(batch.crash_key(r) for r in results if r["status"] == "crash")
     for cause, n in causes.most_common(3):
         lines.append(f"  crash {n}× {cause}")
@@ -1303,10 +1313,10 @@ def build_parser(active: ModuleType, campaign: str | None) -> argparse.ArgumentP
     p.add_argument("--batch-id", default=None, help="set by `run.py batch`: the batch this run belongs to")
     p.add_argument("--parent-run-id", default=None, help="the run this one builds on (set by batch promotion)")
     p.add_argument(
-        "--solver",
-        choices=list(active.SOLVER_MODES),
-        default=active.SOLVER_MODES[0],
-        help="solver mode exposed by the campaign's adapter",
+        "--mode",
+        choices=list(active.MODES),
+        default=active.MODES[0],
+        help="mode exposed by the campaign's adapter",
     )
     active.add_arguments(p)
     return p
@@ -1380,7 +1390,7 @@ def _dispatch(command: str, argv: list[str]) -> int:
         p.add_argument("--limit", type=int, default=QUERY_DEFAULT_LIMIT)
         p.add_argument("--campaign", default=selection.campaign)
         args = p.parse_args(argv)
-        print(query(layout, args.sql, args.limit))
+        print(query(layout, active, args.sql, args.limit))
         return 0
 
     parser = build_parser(active, selection.campaign)

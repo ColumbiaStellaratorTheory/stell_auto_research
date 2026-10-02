@@ -12,7 +12,7 @@ import analysis
 
 def _run(rid: str, status: str = "pass", created: str = "2026-01-01", group=("m", "t"), base="b", **values) -> dict:
     return {
-        "id": rid, "solver": group[0], "equilibrium": group[1], "status": status,
+        "id": rid, "mode": group[0], "target": group[1], "status": status,
         "status_reason": "ok" if status == "pass" else "exit_1", "crash_signature": None,
         "validated": None, "created_at": created, "replicate": 0, "seed": 1,
         "values": values, "spec_base": base,

@@ -99,7 +99,7 @@ def pareto_front(runs: Sequence[Mapping], goals: Goals) -> list[Mapping]:
 
 
 def group_key(run: Mapping) -> str:
-    return f"{run['solver']}/{run['equilibrium']}"
+    return f"{run['mode']}/{run['target']}"
 
 
 def by_group(runs: Iterable[Mapping]) -> dict[str, list[Mapping]]:

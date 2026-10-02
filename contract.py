@@ -11,12 +11,13 @@ side imports the other.
 An adapter is a module exposing:
 
     NAME              str          — identifies the solver family; stored in the
-                                     `coil_type` column.
-    SOLVER_MODES      tuple[str]   — the `--solver` choices; SOLVER_MODES[0] is
-                                     the default.
+                                     `adapter` column.
+    MODES             tuple[str]   — the `--mode` choices; MODES[0] is the
+                                     default (e.g. a cheap screen and a costly
+                                     full solve).
     TARGET_FLAG       str          — argparse dest of the flag naming the target
-                                     configuration (e.g. "equilibrium"); stored
-                                     in the `equilibrium` column. Give it a
+                                     configuration (e.g. "problem", "case");
+                                     stored in the `target` column. Give it a
                                      default so it always has a value.
     REQUIRED_ENV      tuple[str]   — env vars that must be set before a run; the
                                      core checks them and refuses to start
@@ -62,10 +63,9 @@ Adapters read environment variables when a run starts, never at import:
 every registered adapter is imported on every run, including campaigns that
 use a different one.
 
-A *canonical metric key* is a snake_case name an adapter emits in
-`ExperimentOutcome.metrics`. Keys that `run.py` projects into dedicated DB
-columns get their own column; every other key is preserved in the row's
-`metrics` JSON blob.
+Metric keys are snake_case names declared in METRICS. The core stores every
+emitted metric in the run's `metrics` JSON; the `results` view gives each
+declared key its own column for SQL.
 """
 
 from __future__ import annotations
