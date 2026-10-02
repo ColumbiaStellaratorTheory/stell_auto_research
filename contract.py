@@ -43,11 +43,16 @@ An adapter is a module exposing:
     solver_identity(args) -> str   — fingerprint of the solver code that will
                                      run (e.g. commit + uncommitted-diff hash).
                                      Part of the spec hash, so a changed solver
-                                     is never mistaken for an earlier run.
+                                     is never mistaken for an earlier run. It
+                                     may depend only on EXECUTION_FLAGS values
+                                     and the environment (the core caches it).
     run_experiment(args, run: RunContext) -> ExperimentOutcome
                                    — run ONE experiment end-to-end in run.dir.
                                      Must not raise for solver failures — return
                                      an outcome with status "crash"/"fail".
+                                     Launch solvers with `run_solver`, so a
+                                     timeout or cancellation kills the whole
+                                     process tree.
 
 Adapters read environment variables when a run starts, never at import:
 every registered adapter is imported on every run, including campaigns that
@@ -63,12 +68,26 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
 METRIC_GOALS = ("min", "max", None)
+
+# Thread-count variables read by OpenMP and the common math libraries; set all
+# of them, or parallel runs oversubscribe the CPU through whichever one is unset.
+THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMBA_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 
 @dataclass(frozen=True)
@@ -147,3 +166,56 @@ def git_output(root: Path, *git_args: str) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+class Cancelled(BaseException):
+    """The run was asked to stop (SIGTERM). A BaseException so broad `except Exception` handlers let it through."""
+
+
+def thread_env(threads: int) -> dict[str, str]:
+    """Environment entries limiting every common math library to `threads` threads."""
+    return {name: str(threads) for name in THREAD_ENV_VARS}
+
+
+def _new_process_group() -> dict:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait()
+
+
+def run_solver(
+    cmd: list[str],
+    log_path: Path,
+    timeout: float | None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> int | None:
+    """Run `cmd` with stdout+stderr to `log_path`; its exit code, or None on timeout.
+
+    The command runs in its own process group. On timeout, or if the run is
+    interrupted (Cancelled, KeyboardInterrupt), the whole group — the solver
+    and anything it spawned — is killed before returning or re-raising.
+    """
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=cwd, **_new_process_group()
+        )
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            return None
+        except BaseException:
+            _kill_process_tree(proc)
+            raise

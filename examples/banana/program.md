@@ -49,6 +49,8 @@ python run.py --campaign banana --solver single-stage --equilibrium nfp5_iota20 
 
 Output: one JSON line to stdout. The run is recorded in `campaigns/banana/runs/` and indexed in `campaigns/banana/results.db`. An identical earlier pass/fail run is not repeated (`--replicate N` draws another seed); `python run.py replay <id>` re-runs one and compares.
 
+To plan many runs at once, write a batch file (format at the top of `batch.py`) and run it in the background: `python run.py batch plan.json --campaign banana` (`--dry-run` first). A typical shape is a stage2 screen (`halton` over weights, a few equilibria) followed by a stage promoting the best runs to single-stage with `"from"`, `"select"` and `"carry"`.
+
 ### Parameters
 
 **Both solvers:**

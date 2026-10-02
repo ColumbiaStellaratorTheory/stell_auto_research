@@ -6,7 +6,7 @@ stack, so it runs on any machine and serves as the test fixture and as the
 template `/setup-harness` copies when generating an adapter for a real solver.
 
 The shape to copy: register the solver's flags, fingerprint the solver code,
-run it as a subprocess in the run directory with a timeout, parse its results
+run it with `contract.run_solver` in the run directory with a timeout, parse its results
 file, map native keys onto canonical metric keys, report what the run used
 (provenance) and what to keep (evidence), and classify the run — never raising
 for a solver failure. `examples/banana/simsopt_banana.py` shows the same
@@ -20,11 +20,10 @@ import argparse
 import hashlib
 import json
 import math
-import subprocess
 import sys
 from pathlib import Path
 
-from contract import ExperimentOutcome, RunContext
+from contract import ExperimentOutcome, RunContext, run_solver
 
 # --- Contract surface -------------------------------------------------------
 
@@ -92,15 +91,11 @@ def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutco
     ]
     provenance = {"command": cmd, "solver_identity": solver_identity(args)}
     evidence = {"log": log_path}
-    try:
-        with open(log_path, "w") as log:
-            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
-    except subprocess.TimeoutExpired:
+    exit_code = run_solver(cmd, log_path, args.timeout)
+    if exit_code is None:
         return ExperimentOutcome("crash", "timeout", provenance=provenance, evidence=evidence)
-    if result.returncode != 0:
-        return ExperimentOutcome(
-            "crash", f"exit_{result.returncode}", provenance=provenance, evidence=evidence
-        )
+    if exit_code != 0:
+        return ExperimentOutcome("crash", f"exit_{exit_code}", provenance=provenance, evidence=evidence)
     try:
         raw = json.loads(results_path.read_text())
     except (OSError, json.JSONDecodeError) as e:

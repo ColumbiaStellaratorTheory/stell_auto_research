@@ -155,6 +155,10 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      every solver param the agent may set, with the solver's real defaults.
      Only flags the solver actually supports. The core records every flag, so
      there is no list of "kept" params to maintain.
+   - Launch every solver process with `contract.run_solver` (timeouts and
+     cancellation kill the whole process tree) and pass thread counts through
+     `contract.thread_env(n)` (sets OpenMP, OpenBLAS, MKL, BLIS, Accelerate,
+     Numba and NumExpr limits together).
    - Name the solver's combined output `"log"` in `evidence`: the core reads
      its tail to give crashes a `crash_signature`.
    - `solver_identity(args)` — fingerprint of the solver code (commit + hash

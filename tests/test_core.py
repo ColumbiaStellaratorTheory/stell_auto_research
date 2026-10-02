@@ -17,10 +17,12 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -28,6 +30,7 @@ from pathlib import Path
 import adapter
 import analysis
 import contract
+import locks
 import run
 from adapters import toy
 
@@ -310,7 +313,7 @@ class TestRebuild(_ScratchDirTest):
         for rid, created in (("r2", "2026-01-02"), ("r1", "2026-01-01")):
             run.write_run_record(layout.runs_dir, self._record(rid, created))
         self.assertEqual(run.rebuild(layout), 2)
-        with sqlite3.connect(layout.db_path) as db:
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             rows = db.execute("SELECT id, objective_J FROM runs ORDER BY id").fetchall()
         self.assertEqual(rows, [("r1", 1.5), ("r2", 1.5)])
         jsonl_ids = [json.loads(line)["id"] for line in layout.jsonl_path.read_text().splitlines()]
@@ -318,7 +321,7 @@ class TestRebuild(_ScratchDirTest):
 
     def test_rebuild_keeps_a_backup_of_the_old_db(self):
         layout = self._layout()
-        with sqlite3.connect(layout.db_path) as db:
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
         run.rebuild(layout)
         self.assertEqual(len(list(self.root.glob("results.db.bak-*"))), 1)
@@ -334,7 +337,7 @@ class TestRebuild(_ScratchDirTest):
 
     def test_outdated_db_is_refused_with_rebuild_instructions(self):
         layout = self._layout()
-        with sqlite3.connect(layout.db_path) as db:
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
         with self.assertRaisesRegex(run.HarnessError, "schema version 0.*python run.py rebuild"):
             run.open_db(layout)
@@ -401,8 +404,13 @@ class _CliTest(_ScratchDirTest):
         self.demo = _make_campaign(self.campaigns, "demo", {"adapter": "toy"})
 
     def _run(self, *flags: str) -> subprocess.CompletedProcess:
-        env = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns)}
-        for inherited in (run.CAMPAIGN_ENV, "KEEP_ARTIFACTS", "ARTIFACTS_DIR", "OUTPUT_BASE"):
+        env = {
+            **os.environ,
+            run.CAMPAIGNS_DIR_ENV: str(self.campaigns),
+            run.SLOTS_DIR_ENV: str(self.root / "slots"),
+            run.MAX_PARALLEL_ENV: "4",
+        }
+        for inherited in (run.CAMPAIGN_ENV, "KEEP_ARTIFACTS", "ARTIFACTS_DIR", "OUTPUT_BASE", run.BLOBS_DIR_ENV):
             env.pop(inherited, None)
         return subprocess.run(
             [sys.executable, str(REPO_ROOT / "run.py"), *flags],
@@ -430,7 +438,7 @@ class TestEndToEnd(_CliTest):
         log_hash = record["evidence"]["log"]["sha256"]
         self.assertTrue((self.demo / "blobs" / log_hash[:2] / log_hash).exists())
         self.assertTrue(printed["on_front"], "the only passing run is on its front")
-        with sqlite3.connect(self.demo / "results.db") as db:
+        with contextlib.closing(sqlite3.connect(self.demo / "results.db")) as db:
             row = db.execute("SELECT id, seed, spec_hash FROM runs").fetchone()
         self.assertEqual(row, (printed["id"], printed["seed"], record["spec_hash"]))
         self.assertFalse((self.demo / "scratch" / printed["id"]).exists(), "scratch cleaned under 'none'")
@@ -481,7 +489,7 @@ class TestEndToEnd(_CliTest):
         self._json("--problem", "sphere", "--maxiter", "50")
         (self.demo / "results.db").unlink()
         self.assertEqual(self._json("rebuild")["rows"], 1)
-        with sqlite3.connect(self.demo / "results.db") as db:
+        with contextlib.closing(sqlite3.connect(self.demo / "results.db")) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
 
     def test_second_campaign_requires_explicit_selection(self):
@@ -526,7 +534,7 @@ class TestSchemaUpgrade(_ScratchDirTest):
             "id": "r1", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere",
             "status": "crash", "status_reason": "exit_1", "created_at": "2026-01-01",
         })
-        with sqlite3.connect(layout.db_path) as db:
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
             db.execute("PRAGMA user_version = 2")
         with contextlib.closing(run.open_db(layout)) as db:
@@ -608,6 +616,134 @@ class TestCommandsEndToEnd(_CliTest):
         self.assertEqual(rows, ["status\tCOUNT(*)", "pass\t1"])
         table = self._run("campaigns").stdout.splitlines()
         self.assertEqual(table[1].split("\t")[:4], ["demo", "toy", "1", "1"])
+
+
+
+class TestLocksAndSlots(_ScratchDirTest):
+    """Locks are exclusive until released; a held slot sends the next run to another."""
+
+    def test_lock_is_exclusive_until_released(self):
+        path = self.root / "x.lock"
+        held = locks.try_lock(path)
+        self.assertIsNotNone(held)
+        self.assertIsNone(locks.try_lock(path))
+        locks.release(held)
+        again = locks.try_lock(path)
+        self.assertIsNotNone(again)
+        locks.release(again)
+
+    def test_busy_slot_is_skipped(self):
+        first = locks.acquire_slot(self.root, 2)
+        second = locks.acquire_slot(self.root, 2)
+        self.assertIsNone(locks.try_lock(self.root / "slot-0.lock"))
+        self.assertIsNone(locks.try_lock(self.root / "slot-1.lock"))
+        locks.release(first), locks.release(second)
+
+    def test_slot_capacity_comes_from_the_environment(self):
+        slots = run.resolve_slots({run.MAX_PARALLEL_ENV: "3", run.SLOTS_DIR_ENV: "/s"})
+        self.assertEqual((slots.dir, slots.capacity), (Path("/s"), 3))
+        with self.assertRaisesRegex(run.HarnessError, "must be an integer >= 1"):
+            run.resolve_slots({run.MAX_PARALLEL_ENV: "0"})
+
+    def test_campaign_max_parallel_is_validated(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy", "max_parallel": 0})
+        with self.assertRaisesRegex(run.CampaignError, "max_parallel"):
+            run.load_config(d)
+
+    def test_claimed_spec_is_reported_in_progress(self):
+        layout = self._layout()
+        args = run.with_seed(toy, _toy_args(problem="sphere"))
+        digest = run.spec_hash(toy, run.run_spec(args), toy.solver_identity(args))
+        claim = locks.try_lock(layout.claims_dir / f"{digest}-0.lock")
+        self.addCleanup(locks.release, claim)
+        printed = run.run_once(toy, layout, run.Slots(self.root / "slots", 1), args)
+        self.assertEqual(printed, {"in_progress": True, "spec_hash": digest, "replicate": 0})
+        self.assertFalse(layout.runs_dir.exists(), "nothing ran")
+
+    def test_shared_blob_store_from_environment(self):
+        layout = run.resolve_layout(Path("/c/demo"), {run.BLOBS_DIR_ENV: "/machine/blobs"})
+        self.assertEqual(layout.blobs_dir, Path("/machine/blobs"))
+
+
+class TestBatchEndToEnd(_CliTest):
+    """run.py batch: validated up front, parallel children, promotion, reuse, early stop."""
+
+    def _write(self, name: str, content: dict) -> Path:
+        path = self.root / name
+        path.write_text(json.dumps(content))
+        return path
+
+    def _plan(self, *stages, **extra) -> Path:
+        return self._write("plan.json", {
+            "hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
+            "stages": list(stages), **extra,
+        })
+
+    def _rows(self, sql: str) -> list:
+        with contextlib.closing(sqlite3.connect(self.demo / "results.db")) as db:
+            return db.execute(sql).fetchall()
+
+    def test_two_stage_batch_records_batch_and_lineage(self):
+        plan = self._plan(
+            {"name": "screen", "base": {"problem": "rastrigin", "maxiter": 200}, "grid": {"dim": [2, 3, 4]}},
+            {"name": "confirm", "from": "screen", "select": {"top": 2, "by": "objective_J"},
+             "base": {"problem": "rastrigin", "maxiter": 400}, "carry": ["dim"]},
+        )
+        proc = self._run("batch", str(plan))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("screen: 3 runs (0 already recorded)", proc.stdout)
+        self.assertIn("confirm: 2 runs", proc.stdout)
+        batch_ids = self._rows("SELECT DISTINCT batch_id FROM runs")
+        self.assertEqual(len(batch_ids), 1)
+        promoted = self._rows("SELECT r.parent_run_id IN (SELECT id FROM runs WHERE json_extract(params,'$.maxiter') = 200) "
+                              "FROM runs r WHERE json_extract(r.params,'$.maxiter') = 400")
+        self.assertEqual(promoted, [(1,), (1,)], "each promoted run names its screen parent")
+        record = json.loads((self.demo / "batches" / f"{batch_ids[0][0]}.json").read_text())
+        self.assertEqual((record["status"], len(record["stages"]["screen"])), ("done", 3))
+
+    def test_rerun_reuses_recorded_runs(self):
+        plan = self._plan({"base": {"problem": "sphere", "maxiter": 50}, "grid": {"dim": [2, 3]}})
+        self._run("batch", str(plan))
+        again = self._run("batch", str(plan))
+        self.assertIn("2 runs (2 already recorded)", again.stdout)
+        self.assertEqual(self._rows("SELECT COUNT(*) FROM runs"), [(2,)])
+
+    def test_repeated_crash_stops_the_batch(self):
+        plan = self._plan({"base": {"inject": "crash"}, "grid": {"dim": [2, 3, 4, 5, 6]}}, early_stop={"same_crash": 2})
+        proc = self._run("batch", str(plan), "--parallel", "1")
+        self.assertIn("stopped: last 2 runs crashed the same way: injected crash", proc.stdout)
+        self.assertEqual(self._rows("SELECT COUNT(*) FROM runs"), [(2,)])
+
+    def test_invalid_batch_launches_nothing(self):
+        plan = self._plan({"runs": [{"dimm": 3}, {"dim": "x"}]})
+        proc = self._run("batch", str(plan))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unrecognized arguments: --dimm 3", proc.stderr)
+        self.assertIn("invalid int value: 'x'", proc.stderr)
+        self.assertFalse((self.demo / "runs").exists())
+
+    def test_dry_run_reports_the_plan(self):
+        plan = self._plan({"name": "s", "grid": {"dim": [2, 3]}, "replicates": 2})
+        proc = self._run("batch", str(plan), "--dry-run")
+        self.assertIn("s: 4 to run, 0 already recorded", proc.stdout)
+        self.assertFalse((self.demo / "runs").exists())
+
+    @unittest.skipIf(os.name == "nt", "SIGTERM delivery is POSIX-only")
+    def test_sigterm_records_a_cancelled_run(self):
+        env = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns),
+               run.SLOTS_DIR_ENV: str(self.root / "slots"), run.MAX_PARALLEL_ENV: "4"}
+        env.pop(run.CAMPAIGN_ENV, None)
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "run.py"), "--inject", "hang", "--timeout", "600"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=REPO_ROOT,
+        )
+        deadline = time.monotonic() + 30
+        while not list((self.demo / "scratch").glob("*/run.log")) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+        printed = json.loads(out)
+        self.assertEqual((printed["status"], printed["status_reason"]), ("crash", "cancelled"))
 
 
 if __name__ == "__main__":

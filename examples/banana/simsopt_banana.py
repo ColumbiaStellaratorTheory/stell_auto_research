@@ -31,13 +31,12 @@ import json
 import math
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from contract import ExperimentOutcome, RunContext, git_output, sha256_file
+from contract import ExperimentOutcome, RunContext, git_output, run_solver, sha256_file, thread_env
 
 # --- Contract surface -------------------------------------------------------
 
@@ -114,6 +113,8 @@ def config_from_env(environ: Mapping[str, str]) -> BananaConfig:
 # bar; tighter than the survival bar so validation isn't wasted on bad fits.
 POINCARE_FIELD_ERROR_THRESHOLD = 0.1
 POINCARE_SURVIVAL_THRESHOLD = 0.9
+POINCARE_TIMEOUT_SECONDS = 600
+POINCARE_LOG = "poincare.log"
 
 # --- Equilibrium registry: nfp{N}_iota{XX} -> wout filename -----------------
 
@@ -398,23 +399,17 @@ def _run_poincare(run_dir: Path, solver_python: str, poincare_script: Path) -> t
         print("No biot_savart_opt.json for Poincare", file=sys.stderr)
         return "error", None
 
-    env = os.environ.copy()
-    env["POINCARE_OUT_DIR"] = str(bs_files[0].parent)
-
-    try:
-        result = subprocess.run(
-            [solver_python, str(poincare_script)],
-            capture_output=True, text=True, env=env, timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        print("Poincare timed out after 600s", file=sys.stderr)
+    env = {**os.environ, "POINCARE_OUT_DIR": str(bs_files[0].parent)}
+    log_path = run_dir / POINCARE_LOG
+    exit_code = run_solver([solver_python, str(poincare_script)], log_path, POINCARE_TIMEOUT_SECONDS, env=env)
+    if exit_code is None:
+        print(f"Poincare timed out after {POINCARE_TIMEOUT_SECONDS}s", file=sys.stderr)
+        return "error", None
+    if exit_code != 0:
+        print(f"Poincare failed (exit {exit_code})", file=sys.stderr)
         return "error", None
 
-    if result.returncode != 0:
-        print(f"Poincare failed (exit {result.returncode})", file=sys.stderr)
-        return "error", None
-
-    for line in result.stdout.splitlines():
+    for line in log_path.read_text(errors="replace").splitlines():
         if "phi hit counts=" not in line:
             continue
         try:
@@ -522,21 +517,15 @@ def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutco
         provenance["warm_start_seed"] = seed
         provenance["warm_start_seed_sha256"] = sha256_file(Path(seed))
 
-    env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = str(args.omp_threads)
-    env["MKL_NUM_THREADS"] = str(args.omp_threads)
+    env = {**os.environ, **thread_env(args.omp_threads)}
 
     cmd = [solver_python, str(solver_script)] + _build_cli(args, plasma_surf, seed, config, run.dir)
     provenance["command"] = cmd
-    try:
-        with open(log_path, "w") as lf:
-            result = subprocess.run(
-                cmd, stdout=lf, stderr=subprocess.STDOUT, env=env, timeout=args.timeout,
-            )
-    except subprocess.TimeoutExpired:
+    exit_code = run_solver(cmd, log_path, args.timeout, env=env)
+    if exit_code is None:
         return outcome("crash", "timeout", parent_run_id=parent_run_id)
-    if result.returncode != 0:
-        return outcome("crash", f"exit_{result.returncode}", parent_run_id=parent_run_id)
+    if exit_code != 0:
+        return outcome("crash", f"exit_{exit_code}", parent_run_id=parent_run_id)
 
     results_files = sorted(run.dir.rglob("results.json"))
     if not results_files:
@@ -558,6 +547,7 @@ def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutco
     if args.solver == "single-stage" and status == "pass":
         fe = metrics.get("field_error")
         if fe is not None and not _is_missing(fe) and fe < POINCARE_FIELD_ERROR_THRESHOLD:
+            evidence["poincare_log"] = run.dir / POINCARE_LOG
             try:
                 validated, metrics["poincare_uniformity"] = _run_poincare(
                     run.dir, solver_python, solver_root / config.scripts["poincare"]

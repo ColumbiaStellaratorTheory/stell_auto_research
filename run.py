@@ -15,6 +15,7 @@ Usage (experiment flags come from the campaign's adapter; this shows the toy):
     python run.py rebuild --campaign demo [--from-jsonl FILE]      # regenerate results.db/.jsonl
     python run.py campaigns                                        # every campaign at a glance
     python run.py import-lessons --from other --campaign demo      # another campaign's lessons as priors
+    python run.py batch plan.json --campaign demo [--dry-run]      # run a planned batch of experiments
 
 `--campaign` (or $AUTORESEARCH_CAMPAIGN) may be omitted when exactly one
 campaign exists. Each run is written atomically to the campaign's
@@ -27,28 +28,33 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import io
 import hashlib
 import json
 import os
 import platform
 import shutil
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Mapping, MutableMapping
 
 import analysis
+import batch
 from adapter import AdapterError, load_adapter
-from contract import ExperimentOutcome, RunContext, clean, git_output, sha256_file
+from contract import Cancelled, ExperimentOutcome, RunContext, clean, git_output, sha256_file
+from locks import acquire_slot, release, report_waiting, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # From this version on every DB row has a run file, so an older DB can be
 # rebuilt from runs/ without losing anything.
 FIRST_RECORD_BACKED_VERSION = 2
@@ -56,13 +62,20 @@ CONFIG_NAME = "config.json"
 CAMPAIGN_ENV = "AUTORESEARCH_CAMPAIGN"
 CAMPAIGNS_DIR_ENV = "AUTORESEARCH_CAMPAIGNS_DIR"
 KEEP_ARTIFACTS_CHOICES = ("none", "pass", "all")
-COMMANDS = ("replay", "rebuild", "brief", "query", "campaigns", "import-lessons")
+COMMANDS = ("replay", "rebuild", "brief", "query", "campaigns", "import-lessons", "batch")
+SLOTS_DIR_ENV = "AUTORESEARCH_SLOTS_DIR"
+MAX_PARALLEL_ENV = "AUTORESEARCH_MAX_PARALLEL"
+BLOBS_DIR_ENV = "AUTORESEARCH_BLOBS_DIR"
+MACHINE_DIR = Path.home() / ".autoresearch"
+CANCELLED_EXIT = 143
+BATCH_POLL_SECONDS = 0.2
+BATCH_SUMMARY_ROWS = 10
 LESSONS_NAME = "LESSONS.md"
 QUERY_DEFAULT_LIMIT = 50
 QUERY_CELL_CHARS = 120
 LOG_TAIL_BYTES = 64 * 1024
 # Core flags that select how the harness runs, not what the solver computes.
-CORE_FLAGS = ("campaign", "replicate")
+CORE_FLAGS = ("campaign", "replicate", "batch_id", "parent_run_id")
 # Prior results that make a repeat redundant; a crash can always be retried.
 DEDUPE_STATUSES = ("pass", "fail")
 REPLAY_MISMATCH_EXIT = 2
@@ -89,7 +102,7 @@ COLUMN_METRIC_KEYS = (
 )
 IDENTITY_COLUMNS = (
     "id", "coil_type", "solver", "equilibrium", "experiment_group",
-    "spec_hash", "replicate", "seed", "parent_run_id", "replay_of",
+    "spec_hash", "replicate", "seed", "parent_run_id", "replay_of", "batch_id",
     "status", "status_reason", "crash_signature", "validated", "elapsed", "created_at",
 )
 JSON_COLUMNS = ("metrics", "params", "provenance", "evidence")
@@ -98,7 +111,7 @@ DB_COLUMNS = IDENTITY_COLUMNS + COLUMN_METRIC_KEYS + JSON_COLUMNS
 # Identity fields shown in the stdout summary when set; metrics follow.
 SUMMARY_FIELDS = (
     "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
-    "validated", "parent_run_id", "replay_of", "replicate", "seed", "elapsed",
+    "validated", "parent_run_id", "replay_of", "batch_id", "replicate", "seed", "elapsed",
 )
 # Run fields the analysis views carry besides metric values.
 VIEW_FIELDS = (
@@ -125,11 +138,13 @@ class CampaignConfig:
 
     `env` supplies adapter configuration (solver paths, interpreters) without
     shell-specific export syntax; a variable already set in the environment
-    takes precedence over the config value.
+    takes precedence over the config value. `max_parallel` caps how many of
+    the machine's run slots one batch of this campaign uses at once.
     """
 
     adapter: str
     env: Mapping[str, str]
+    max_parallel: int | None = None
 
 
 def campaigns_root(environ: Mapping[str, str]) -> Path:
@@ -186,7 +201,29 @@ def load_config(campaign_dir: Path) -> CampaignConfig:
         isinstance(k, str) and isinstance(v, str) for k, v in env.items()
     ):
         raise CampaignError(f"{path}: \"env\" must map names to string values")
-    return CampaignConfig(adapter=adapter_name, env=env)
+    max_parallel = raw.get("max_parallel")
+    if max_parallel is not None and (isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1):
+        raise CampaignError(f"{path}: \"max_parallel\" must be an integer >= 1")
+    return CampaignConfig(adapter=adapter_name, env=env, max_parallel=max_parallel)
+
+
+@dataclass(frozen=True)
+class Slots:
+    """The machine-wide run-slot pool: `capacity` lock files under `dir`.
+
+    Every run, from any campaign, holds one slot while it executes, so the
+    machine never runs more than `capacity` experiments at once.
+    """
+
+    dir: Path
+    capacity: int
+
+
+def resolve_slots(environ: Mapping[str, str]) -> Slots:
+    raw = environ.get(MAX_PARALLEL_ENV, "1")
+    if not raw.isdigit() or int(raw) < 1:
+        raise HarnessError(f"${MAX_PARALLEL_ENV} must be an integer >= 1, got {raw!r}")
+    return Slots(Path(environ.get(SLOTS_DIR_ENV, str(MACHINE_DIR / "slots"))), int(raw))
 
 
 def apply_env(defaults: Mapping[str, str], environ: MutableMapping[str, str]) -> None:
@@ -226,6 +263,7 @@ class Layout:
     scratch_dir: Path
     artifacts_dir: Path
     keep_artifacts: str
+    shared_blobs_dir: Path | None = None
 
     @property
     def runs_dir(self) -> Path:
@@ -233,7 +271,16 @@ class Layout:
 
     @property
     def blobs_dir(self) -> Path:
-        return self.campaign_dir / "blobs"
+        """Evidence store: machine-wide when $AUTORESEARCH_BLOBS_DIR is set, else per campaign."""
+        return self.shared_blobs_dir or self.campaign_dir / "blobs"
+
+    @property
+    def claims_dir(self) -> Path:
+        return self.campaign_dir / "claims"
+
+    @property
+    def batches_dir(self) -> Path:
+        return self.campaign_dir / "batches"
 
     @property
     def db_path(self) -> Path:
@@ -254,6 +301,7 @@ def resolve_layout(campaign_dir: Path, environ: Mapping[str, str]) -> Layout:
         scratch_dir=Path(environ.get("OUTPUT_BASE", str(campaign_dir / "scratch"))),
         artifacts_dir=Path(environ.get("ARTIFACTS_DIR", str(campaign_dir / "artifacts"))),
         keep_artifacts=keep,
+        shared_blobs_dir=Path(environ[BLOBS_DIR_ENV]) if environ.get(BLOBS_DIR_ENV) else None,
     )
 
 
@@ -418,8 +466,15 @@ _INSERT_SQL = (
 
 
 def _create_schema(db: sqlite3.Connection) -> None:
-    db.executescript(SCHEMA_PATH.read_text())
-    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    """Create the tables and stamp the schema version in one transaction.
+
+    Concurrent first runs must never see the table without its version, so
+    both happen atomically; IF NOT EXISTS makes a second creator a no-op.
+    """
+    db.execute("PRAGMA journal_mode = WAL")
+    db.executescript(
+        f"BEGIN IMMEDIATE;\n{SCHEMA_PATH.read_text()}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+    )
 
 
 def _schema_version(db: sqlite3.Connection) -> int | None:
@@ -564,8 +619,9 @@ def _build_record(
         "spec_hash": digest,
         "replicate": args.replicate,
         "seed": getattr(args, active.SEED_FLAG) if active.SEED_FLAG else None,
-        "parent_run_id": outcome.parent_run_id,
+        "parent_run_id": outcome.parent_run_id or getattr(args, "parent_run_id", None),
         "replay_of": replay_of,
+        "batch_id": getattr(args, "batch_id", None),
         "status": outcome.status,
         "status_reason": outcome.status_reason,
         "crash_signature": crash_signature,
@@ -672,6 +728,9 @@ def execute(
     t0 = time.monotonic()
     try:
         outcome = active.run_experiment(args, RunContext(run_id=run_id, dir=run_dir))
+    except Cancelled:
+        print("Run cancelled; recording it.", file=sys.stderr)
+        outcome = ExperimentOutcome("crash", "cancelled")
     except Exception as e:
         # Truly-unexpected adapter failure (the adapter never returned an
         # outcome). The record still carries the full run spec, so the
@@ -694,25 +753,38 @@ def execute(
     return record
 
 
-def run_once(active: ModuleType, layout: Layout, args: argparse.Namespace) -> None:
-    """Run the experiment unless an identical pass/fail run is already recorded."""
+def run_once(active: ModuleType, layout: Layout, slots: Slots, args: argparse.Namespace) -> dict:
+    """Run the experiment unless it is already recorded or running; return the stdout object.
+
+    Order: claim the spec (so concurrent agents never run it twice), check for
+    an earlier pass/fail run, then wait for a machine-wide slot and execute.
+    """
     identity = active.solver_identity(args)
     digest = spec_hash(active, run_spec(args), identity)
-    duplicate = find_duplicate(layout, digest, args.replicate)
-    if duplicate:
-        print(
-            f"Already run as {duplicate['id']}; pass --replicate N for another sample.",
-            file=sys.stderr,
-        )
-        print(json.dumps({"duplicate_of": duplicate["id"], "status": duplicate["status"],
-                          "status_reason": duplicate["status_reason"],
-                          "spec_hash": digest, "replicate": args.replicate}))
-        return
-    record = execute(active, layout, args, identity)
+    claim = try_lock(layout.claims_dir / f"{digest}-{args.replicate}.lock")
+    if claim is None:
+        print("This spec is running in another process right now.", file=sys.stderr)
+        return {"in_progress": True, "spec_hash": digest, "replicate": args.replicate}
+    try:
+        duplicate = find_duplicate(layout, digest, args.replicate)
+        if duplicate:
+            print(
+                f"Already run as {duplicate['id']}; pass --replicate N for another sample.",
+                file=sys.stderr,
+            )
+            return {"duplicate_of": duplicate["id"], "status": duplicate["status"],
+                    "status_reason": duplicate["status_reason"], "replicate": args.replicate}
+        slot = acquire_slot(slots.dir, slots.capacity, report_waiting(slots.capacity))
+        try:
+            record = execute(active, layout, args, identity)
+        finally:
+            release(slot)
+    finally:
+        release(claim)
     on_front = None
     if record["status"] == "pass":
         on_front = record["id"] in analysis.front_ids(load_views(layout, active), active.METRICS)
-    print(json.dumps(summary(record, on_front)))
+    return summary(record, on_front)
 
 
 def _finalize_run_dir(layout: Layout, run_dir: Path, status: str, run_id: str) -> None:
@@ -880,6 +952,232 @@ def import_lessons(source_dir: Path, target_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Batches (planning in batch.py; execution here)
+# ---------------------------------------------------------------------------
+
+def _flag(dest: str) -> str:
+    return "--" + dest.replace("_", "-")
+
+
+def planned_argv(planned: batch.PlannedRun, campaign: str, batch_id: str) -> list[str]:
+    """The run.py command-line arguments that execute one planned run."""
+    argv = ["--campaign", campaign, "--batch-id", batch_id, "--replicate", str(planned.replicate)]
+    if planned.parent_run_id:
+        argv += ["--parent-run-id", planned.parent_run_id]
+    for dest, value in sorted(planned.spec.items()):
+        argv += [_flag(dest), str(value)]
+    return argv
+
+
+def _parse_planned(parser: argparse.ArgumentParser, argv: list[str]) -> argparse.Namespace | str:
+    """The parsed args for `argv`, or argparse's error message."""
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(errors):
+            return parser.parse_args(argv)
+    except SystemExit:
+        return errors.getvalue().strip().splitlines()[-1]
+
+
+@dataclass
+class _IdentityCache:
+    """solver_identity per distinct execution-flag values (contract: it depends on nothing else)."""
+
+    active: ModuleType
+    known: dict = field(default_factory=dict)
+
+    def __call__(self, args: argparse.Namespace) -> str:
+        key = json.dumps({k: getattr(args, k, None) for k in self.active.EXECUTION_FLAGS}, sort_keys=True)
+        if key not in self.known:
+            self.known[key] = self.active.solver_identity(args)
+        return self.known[key]
+
+
+def check_planned(
+    active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, planned: list[batch.PlannedRun],
+    campaign: str, identity: _IdentityCache,
+) -> tuple[list[str], list[str], list[str]]:
+    """(argv per run to launch, already-recorded duplicates, errors), without running anything."""
+    launch, duplicates, errors, seen = [], [], [], set()
+    for i, run_plan in enumerate(planned):
+        argv = planned_argv(run_plan, campaign, "check")
+        parsed = _parse_planned(parser, argv)
+        if isinstance(parsed, str):
+            errors.append(f"{run_plan.stage} run {i} {dict(run_plan.spec)}: {parsed}")
+            continue
+        args = with_seed(active, parsed)
+        digest = spec_hash(active, run_spec(args), identity(args))
+        key = (digest, args.replicate)
+        if key in seen:
+            continue
+        seen.add(key)
+        duplicate = find_duplicate(layout, digest, args.replicate)
+        if duplicate:
+            duplicates.append(duplicate["id"])
+        else:
+            launch.append(argv)
+    return launch, duplicates, errors
+
+
+def _result_view(record: Mapping[str, object]) -> dict:
+    """A run's record as an analysis view (enough for promotion and the summary)."""
+    return {
+        "id": record["id"], "status": record["status"], "status_reason": record.get("status_reason"),
+        "crash_signature": record.get("crash_signature"), "equilibrium": record.get("equilibrium"),
+        "solver": record.get("solver"), "values": metric_values(record),
+    }
+
+
+def _read_record(layout: Layout, run_id: str) -> dict:
+    return json.loads((layout.runs_dir / f"{run_id}.json").read_text())
+
+
+def launch_runs(
+    layout: Layout, argvs: list[list[str]], parallel: int, same_crash: int,
+    completed: list[dict], log: Path,
+) -> tuple[list[dict], str | None, int]:
+    """Run each argv as its own `run.py` process, `parallel` at a time.
+
+    Stops launching (in-flight runs finish) once the early-stop rule fires.
+    Returns (result views of this call's runs, stop reason or None, number of
+    children that exited without a result — their stderr is in `log`). On
+    cancellation, children are sent SIGTERM so each records itself as cancelled.
+    """
+    queue, running, results, stop, failed = list(argvs), [], [], None, 0
+    with open(log, "a") as stderr:
+        try:
+            while running or (queue and stop is None):
+                while queue and len(running) < parallel and stop is None:
+                    argv = queue.pop(0)
+                    running.append(subprocess.Popen(
+                        [sys.executable, str(REPO_ROOT / "run.py"), *argv],
+                        stdout=subprocess.PIPE, stderr=stderr, text=True,
+                    ))
+                finished = [proc for proc in running if proc.poll() is not None]
+                if not finished:
+                    time.sleep(BATCH_POLL_SECONDS)
+                    continue
+                for proc in finished:
+                    running.remove(proc)
+                    out = proc.communicate()[0].strip().splitlines()
+                    printed = json.loads(out[-1]) if out else {}
+                    run_id = printed.get("id") or printed.get("duplicate_of")
+                    if run_id is None:
+                        failed += proc.returncode != 0
+                        continue
+                    view = {**_result_view(_read_record(layout, run_id)), "reused": "duplicate_of" in printed}
+                    results.append(view)
+                    completed.append(view)
+                    stop = stop or batch.should_stop(completed, same_crash)
+        except BaseException:
+            for proc in running:
+                proc.terminate()
+            for proc in running:
+                proc.wait()
+            raise
+    return results, stop, failed
+
+
+def _summary_lines(stage: str, results: list[dict], metric_goals: Mapping[str, str | None]) -> list[str]:
+    counts = Counter(r["status"] for r in results)
+    reused = sum(1 for r in results if r.get("reused"))
+    goals = analysis.active_goals(results, metric_goals)
+    lines = [
+        f"{stage}: {len(results)} runs ({reused} already recorded) — "
+        f"{counts['pass']} pass, {counts['fail']} fail, {counts['crash']} crash"
+    ]
+    front = analysis.pareto_front(results, goals)
+    for r in front[:BATCH_SUMMARY_ROWS]:
+        values = " ".join(f"{m}={analysis.fmt(r['values'][m])}" for m, _ in goals)
+        lines.append(f"  front {r['id']} {r['solver']}/{r['equilibrium']} {values}")
+    causes = Counter(batch.crash_key(r) for r in results if r["status"] == "crash")
+    for cause, n in causes.most_common(3):
+        lines.append(f"  crash {n}× {cause}")
+    return lines
+
+
+def run_batch(
+    active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, campaign: str,
+    path: Path, parallel: int, dry_run: bool,
+) -> int:
+    """Validate a batch file, then run its stages in order; print a capped summary."""
+    plan = batch.load_batch(path, active.METRICS)
+    identity = _IdentityCache(active)
+    dests = set(vars(parser.parse_args([])))
+    errors, previews = [], []
+    for stage in plan.stages:
+        if stage.source is None:
+            launch, duplicates, stage_errors = check_planned(
+                active, layout, parser, batch.plan_stage(stage), campaign, identity
+            )
+            errors += stage_errors
+            previews.append(f"{stage.name}: {len(launch)} to run, {len(duplicates)} already recorded")
+        else:
+            unknown = sorted(k for k in [*stage.base, *stage.carry] if k not in dests)
+            if unknown:
+                errors.append(f"{stage.name}: unknown params {unknown}")
+            previews.append(
+                f"{stage.name}: top {stage.top} of {stage.source} by {stage.rank_by} × {stage.replicates} replicates"
+            )
+    if errors:
+        raise HarnessError("batch has invalid runs; nothing was launched:\n" + "\n".join(f"- {e}" for e in errors))
+    if dry_run:
+        print(f"batch {path} (valid) · parallel {parallel}\n" + "\n".join(previews))
+        return 0
+
+    batch_id = _uuid7()
+    started = time.monotonic()
+    record_path = layout.batches_dir / f"{batch_id}.json"
+    batch_record = {
+        "id": batch_id, "source": str(path), "sha256": sha256_file(path),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "hypothesis": plan.hypothesis, "lessons": plan.lessons, "parallel": parallel,
+        "batch": plan.raw, "status": "running", "stages": {},
+    }
+    _write_atomic(record_path, json.dumps(batch_record, indent=1).encode())
+    log = layout.batches_dir / f"{batch_id}.log"
+    results_by_stage: dict[str, list[dict]] = {}
+    completed: list[dict] = []
+    stop = None
+    lines = []
+    try:
+        for stage in plan.stages:
+            if stop:
+                break
+            if stage.source is None:
+                planned = batch.plan_stage(stage)
+            else:
+                selected = batch.select_runs(stage, results_by_stage.get(stage.source, []), active.METRICS)
+                params = {r["id"]: _read_record(layout, r["id"])["params"] for r in selected}
+                planned = batch.plan_promotion(stage, selected, params)
+            _, _, stage_errors = check_planned(active, layout, parser, planned, campaign, identity)
+            if stage_errors:
+                lines.append(f"{stage.name}: skipped, invalid promoted runs: {stage_errors[0]}")
+                continue
+            argvs = [planned_argv(p, campaign, batch_id) for p in planned]
+            results, stop, failed = launch_runs(layout, argvs, parallel, plan.same_crash_stop, completed, log)
+            results_by_stage[stage.name] = results
+            batch_record["stages"][stage.name] = [r["id"] for r in results]
+            lines += _summary_lines(stage.name, results, active.METRICS)
+            if failed:
+                lines.append(f"  {failed} runs exited without a result (see the stderr log)")
+        batch_record["status"] = "stopped" if stop else "done"
+    except BaseException:
+        batch_record["status"] = "cancelled"
+        raise
+    finally:
+        batch_record["stop_reason"] = stop
+        batch_record["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_atomic(record_path, json.dumps(batch_record, indent=1).encode())
+    head = (
+        f"batch {batch_id} · {len(completed)} runs · {round(time.monotonic() - started)}s · "
+        f"{'stopped: ' + stop if stop else 'done'}"
+    )
+    print("\n".join([head, *lines, f"details: {record_path} · children's stderr: {log}"]))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -894,6 +1192,8 @@ def build_parser(active: ModuleType, campaign: str | None) -> argparse.ArgumentP
         "--replicate", type=int, default=0,
         help="sample index of this spec; a new index draws a new derived seed (default 0)",
     )
+    p.add_argument("--batch-id", default=None, help="set by `run.py batch`: the batch this run belongs to")
+    p.add_argument("--parent-run-id", default=None, help="the run this one builds on (set by batch promotion)")
     p.add_argument(
         "--solver",
         choices=list(active.SOLVER_MODES),
@@ -965,20 +1265,42 @@ def _dispatch(command: str, argv: list[str]) -> int:
         check_required_env(active, os.environ, campaign_dir)
         return 0 if replay(active, layout, parser, args.run_id) else REPLAY_MISMATCH_EXIT
 
+    if command == "batch":
+        p = argparse.ArgumentParser(description="Run a planned batch of experiments (see batch.py)")
+        p.add_argument("file", type=Path)
+        p.add_argument("--campaign", default=selection.campaign)
+        p.add_argument("--parallel", type=int, default=None, help="runs at once (capped by the campaign and machine)")
+        p.add_argument("--dry-run", action="store_true", help="validate and show the plan without running")
+        args = p.parse_args(argv)
+        if args.parallel is not None and args.parallel < 1:
+            raise HarnessError("--parallel must be >= 1")
+        check_required_env(active, os.environ, campaign_dir)
+        slots = resolve_slots(os.environ)
+        parallel = min(args.parallel or config.max_parallel or slots.capacity, config.max_parallel or slots.capacity, slots.capacity)
+        return run_batch(active, layout, parser, campaign_dir.name, args.file, parallel, args.dry_run)
+
     args = parser.parse_args(argv)
     check_required_env(active, os.environ, campaign_dir)
-    run_once(active, layout, with_seed(active, args))
+    print(json.dumps(run_once(active, layout, resolve_slots(os.environ), with_seed(active, args))))
     return 0
+
+
+def _raise_cancelled(_signum: int, _frame: object) -> None:
+    raise Cancelled()
 
 
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     command = argv.pop(0) if argv and argv[0] in COMMANDS else "run"
+    signal.signal(signal.SIGTERM, _raise_cancelled)
     try:
         code = _dispatch(command, argv)
-    except (HarnessError, AdapterError) as e:
+    except (HarnessError, AdapterError, batch.BatchError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+    except Cancelled:
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(CANCELLED_EXIT)
     sys.exit(code)
 
 

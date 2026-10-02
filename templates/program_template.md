@@ -225,12 +225,20 @@ suggests a better way to spend the next experiment:
 1. **Brief**: `python run.py brief` — what has been tried, the fronts, the gaps.
 2. **Think**: What is the objective rewarding? Why did that config fail?
    Which lessons does the next experiment apply, test, or reject? Name them.
-3. **Run**: `python run.py --campaign {{CAMPAIGN_SLUG}} --solver ... [params]`
-   (exact repeats are refused automatically; `--replicate N` samples again).
-4. **Evaluate**: Read the JSON output — `on_front` says whether a passing run
-   joined its mode/target's Pareto front; a crash carries `crash_signature`.
-5. **Record**: If the result generalizes, append to `LESSONS.md`.
-6. **Repeat.**
+3. **Plan**: write a batch file (format at the top of `batch.py`): a
+   hypothesis, the lessons it cites, and stages — explicit runs, grids,
+   `halton`/`lhs` samples, replicates, and promotion of the best runs to a
+   costlier stage. Check it with `python run.py batch plan.json --campaign
+   {{CAMPAIGN_SLUG}} --dry-run`. A single experiment is still
+   `python run.py --campaign {{CAMPAIGN_SLUG}} [params]`.
+4. **Run**: launch the batch in the background and wait for it to finish —
+   do not poll. Exact repeats are reused, not re-run; repeated identical
+   crashes stop it early.
+5. **Evaluate**: read the batch summary (per-stage counts, front members,
+   crash causes), then `run.py brief` / `run.py query` for anything deeper.
+   `on_front` marks runs that joined their Pareto front.
+6. **Record**: If the result generalizes, append to `LESSONS.md`.
+7. **Repeat.**
 
 {{AUTONOMY_POLICY}}
 <!-- Pick one and delete the other:

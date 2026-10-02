@@ -46,13 +46,13 @@ campaign  (one research goal)
 
 ## Step 4 — batches
 
-- [ ] 22. `run.py batch <file>`: validate every spec before launch, skip duplicates, run in parallel within budget, early-stop on repeated crashes, tag rows with batch id + file hash, one summary at the end. Agent launches in background and waits for the completion notification (no polling).
-- [ ] 23. Sobol / grid / replicate generators; two stages in one batch (cheap screen, then promote top-k by an agent-chosen rule).
-- [ ] 24. Kill the whole process tree on timeout or early stop (process group on POSIX, job object on Windows).
-- [ ] 25. Thread limits for every math library: `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `BLIS_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`, `NUMBA_NUM_THREADS`, `NUMEXPR_NUM_THREADS`.
-- [ ] 26. Machine-wide slot pool (`~/.autoresearch/slots`, cross-platform file locks); `run.py batch` takes a slot per run; campaigns share the machine by configured weights.
-- [ ] 27. Claim `spec_hash` before running so concurrent agents on one campaign never run the same spec twice.
-- [ ] 28. Machine-wide content-addressed store for seeds and evidence packs.
+- [x] 22. `run.py batch FILE [--parallel N] [--dry-run]`: every spec parsed against the adapter's flags before anything launches; recorded specs reused; each spec its own `run.py` process; early stop after N identical crashes (default 3, `0` disables); rows tagged `batch_id` (schema v4); `batches/<id>.json` keeps the file, its sha256, hypothesis, cited lessons (required fields), run ids and stop reason; children's stderr in `batches/<id>.log`; capped summary.
+- [x] 23. Generators: explicit `runs`, `grid`, `halton` (low-discrepancy) and seeded `lhs`, ranges with `log`/`int` tags, `replicates`; promotion stages (`from` + `select` by goal metric or `front` + `carry`) with the source run recorded as parent (`--parent-run-id`). (Halton instead of Sobol: Sobol needs a direction-number table the stdlib does not ship.)
+- [x] 24. `contract.run_solver`: solver in its own process group; timeout or cancellation kills the whole group (POSIX killpg, Windows taskkill /T). SIGTERM → `Cancelled` → the run is recorded as `cancelled`; a cancelled batch SIGTERMs its children.
+- [x] 25. `contract.thread_env(n)` sets all seven thread variables; banana uses it.
+- [x] 26. Machine-wide slot pool (`AUTORESEARCH_MAX_PARALLEL`, lock files in `~/.autoresearch/slots`, OS-released on death, `locks.py`); every run holds a slot; per-campaign cap `max_parallel` in config.json (caps rather than weights).
+- [x] 27. Each run takes a lock on `claims/<spec_hash>-<replicate>.lock` before the duplicate check, so concurrent agents never run the same spec twice (the loser prints `in_progress`). First-time DB creation made atomic (tables + version in one transaction).
+- [x] 28. `AUTORESEARCH_BLOBS_DIR` makes the evidence store machine-wide (default stays per campaign so a campaign folder is self-contained). Seed stores remain adapter settings (banana: `STAGE2_SEED_DIR`).
 
 ## Step 5 — hardware-aware setup
 

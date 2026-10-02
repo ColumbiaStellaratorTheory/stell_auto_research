@@ -33,6 +33,8 @@ campaigns/<name>/
   blobs/                  ← evidence files (logs, results, solver patches) by content hash
   results.db              ← query index of runs/ (query with SQL)
   results.jsonl           ← flat export of runs/, written by `run.py rebuild`
+  batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, run ids
+  claims/                 ← per-spec locks (a spec runs in one process at a time)
   scratch/                ← live run directories
 ```
 
@@ -151,10 +153,57 @@ of every run, so no flag is ever lost.
 | `python run.py rebuild [--from-jsonl FILE]` | regenerate `results.db` / `results.jsonl` from `runs/` |
 | `python run.py campaigns` | every campaign: adapter, run counts, last run, runs since its front moved |
 | `python run.py import-lessons --from OTHER` | append another campaign's lessons to this one's `LESSONS.md`, marked as priors |
+| `python run.py batch FILE [--parallel N] [--dry-run]` | run a planned batch of experiments (below) |
 
 A crashed run's `crash_signature` is the line in its log that names the failure
 (the last `...Error:` line, else the last line), with paths and numbers
 normalized so the same failure groups together across runs.
+
+## Batches
+
+Instead of thinking before every single run, the agent can plan a batch: write
+one JSON file, run it in the background, and analyze the summary when it
+finishes. The format is documented at the top of `batch.py`:
+
+```json
+{
+  "hypothesis": "what this batch should show",
+  "lessons": {"applies": [], "tests": [], "rejects": []},
+  "early_stop": {"same_crash": 3},
+  "stages": [
+    {"name": "screen", "base": {"problem": "rastrigin", "dim": 4},
+     "halton": {"n": 16, "ranges": {"step_size": [0.01, 1.0, "log"], "maxiter": [200, 2000, "int"]}}},
+    {"name": "confirm", "from": "screen", "select": {"top": 3, "by": "objective_J"},
+     "base": {"problem": "rastrigin", "dim": 4, "maxiter": 5000}, "carry": ["step_size"], "replicates": 3}
+  ]
+}
+```
+
+- **Points:** `runs` (explicit), `grid` (cartesian product), `halton`
+  (low-discrepancy sequence) and `lhs` (seeded Latin hypercube); ranges are
+  `[min, max]` plus optional `"log"` / `"int"`. Each point is merged into
+  `base` and run `replicates` times.
+- **Promotion:** a stage with `from` takes the best passing runs of an earlier
+  stage (`"by"`: a goal metric, or `"front"` for the Pareto front), carries
+  the named params, and records the source run as each new run's parent.
+- **Before anything runs** every spec is parsed against the adapter's flags;
+  any error stops the whole batch. `--dry-run` shows the plan and how many
+  runs are already recorded.
+- **While it runs:** each spec is its own `run.py` process; specs already
+  recorded are reused, not re-run; launching stops once the last
+  `same_crash` runs crashed the same way (0 disables). Children's stderr goes
+  to `batches/<id>.log`, so the summary stays short.
+- **Waiting is free:** run it in the background and read the summary when it
+  ends; SIGTERM (or Ctrl-C) cancels it, and each in-flight run records itself
+  as `cancelled` after its solver's whole process tree is killed.
+
+## Machine budget
+
+Every run, from every campaign, holds one of the machine's run slots while it
+executes (`AUTORESEARCH_MAX_PARALLEL`, default 1; lock files under
+`~/.autoresearch/slots`), so the machine is never oversubscribed however many
+agents and batches run at once. A campaign's `config.json` may cap its own
+batches with `"max_parallel": N`. Slots are released by the OS if a run dies.
 
 ## Environment variables
 
@@ -162,6 +211,9 @@ normalized so the same failure groups together across runs.
 |----------|-------------|
 | `AUTORESEARCH_CAMPAIGN` | *(optional)* campaign to use when `--campaign` is not given. |
 | `AUTORESEARCH_CAMPAIGNS_DIR` | *(optional)* where campaigns live (default `<repo>/campaigns`). |
+| `AUTORESEARCH_MAX_PARALLEL` | *(optional)* machine-wide run slots (default 1). |
+| `AUTORESEARCH_SLOTS_DIR` | *(optional)* where the slot lock files live (default `~/.autoresearch/slots`). |
+| `AUTORESEARCH_BLOBS_DIR` | *(optional)* one evidence store shared by every campaign (default: each campaign's `blobs/`). |
 | `OUTPUT_BASE` | *(optional)* scratch dir for live runs (default `campaigns/<name>/scratch`). |
 | `KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `ARTIFACTS_DIR/<run-id>`. |
 | `ARTIFACTS_DIR` | *(optional)* where kept run dirs land, named by run id (default `campaigns/<name>/artifacts`). |
@@ -220,6 +272,8 @@ column.
 contract.py                     ← harness↔adapter contract (ExperimentOutcome, helpers)
 run.py                          ← generic experiment runner (solver-agnostic)
 analysis.py                     ← derived views: crash signatures, Pareto fronts, the brief
+batch.py                        ← batch files: validation, spec expansion, promotion, early stop
+locks.py                        ← OS-released file locks for run slots and spec claims
 adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)

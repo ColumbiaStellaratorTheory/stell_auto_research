@@ -29,6 +29,8 @@ campaigns/*/results.db.*
 campaigns/*/runs/
 campaigns/*/blobs/
 campaigns/*/scratch/
+campaigns/*/claims/
+campaigns/*/batches/
 campaigns/*/artifacts/
 
 # Environment (machine-specific paths)

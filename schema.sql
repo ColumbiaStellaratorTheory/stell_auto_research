@@ -1,6 +1,7 @@
 -- results.db is a query index rebuilt from the campaign's runs/*.json records
 -- (`python run.py rebuild`). Bump SCHEMA_VERSION in run.py with any change here.
-PRAGMA journal_mode = WAL;
+-- run.py applies this script inside one transaction together with the
+-- schema version, so keep it to CREATE statements (no PRAGMAs).
 
 CREATE TABLE IF NOT EXISTS runs (
     -- identity
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS runs (
     seed                    INTEGER,         -- value of the adapter's SEED_FLAG (given or derived); NULL if the solver has none
     parent_run_id           TEXT,            -- run this one built on (e.g. its warm-start seed's run)
     replay_of               TEXT,            -- run this one replays (`run.py replay`)
+    batch_id                TEXT,            -- batch this run belongs to (`run.py batch`; file under batches/)
     -- outcome
     status                  TEXT NOT NULL,
     status_reason           TEXT,
@@ -53,6 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_equilibrium  ON runs(equilibrium);
 CREATE INDEX IF NOT EXISTS idx_runs_group        ON runs(experiment_group);
 CREATE INDEX IF NOT EXISTS idx_runs_spec         ON runs(spec_hash, replicate);
 CREATE INDEX IF NOT EXISTS idx_runs_parent       ON runs(parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_batch        ON runs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status       ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_crash        ON runs(crash_signature);
 CREATE INDEX IF NOT EXISTS idx_runs_validated    ON runs(validated);
