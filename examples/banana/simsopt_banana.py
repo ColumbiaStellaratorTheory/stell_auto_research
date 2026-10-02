@@ -1,4 +1,4 @@
-"""simsopt banana-coil solver adapter — the reference adapter implementation.
+"""simsopt banana-coil solver adapter — a real-world example adapter.
 
 Implements the harness↔adapter contract (see contract.py) for the banana-coil
 campaign on a simsopt fork. Two solver modes:
@@ -9,10 +9,10 @@ campaign on a simsopt fork. Two solver modes:
                    (slow; warm-starts from an archived stage2 seed, then runs
                    Poincaré validation).
 
-Each mode is one subprocess against the fork's solver scripts. This file is the
-worked example the `/setup-harness` skill reads when generating an adapter for
-a different solver (e.g. a DESC umbilic-coil pipeline, whose `run_experiment`
-chains several subprocesses instead of running one).
+Each mode is one subprocess against the fork's solver scripts. Unlike the toy
+reference adapter (adapters/toy.py) it shows multiple modes, a warm-start seed
+store shared between them, and independent validation. A campaign selects it
+with `"adapter": "examples.banana.simsopt_banana"` in its config.json.
 
 Configuration is read from the environment at import (fail-fast); see
 ENV_REQUIREMENTS. Script paths default to the fork's standard layout and may be
@@ -37,6 +37,7 @@ from contract import ExperimentOutcome, require_env
 
 NAME = "banana"
 SOLVER_MODES = ("stage2", "single-stage")
+TARGET_FLAG = "equilibrium"
 ENV_REQUIREMENTS = (
     "SIMSOPT_ROOT",
     "SIMSOPT_PYTHON",
@@ -68,7 +69,7 @@ SCRIPTS = {
 
 # Stage 2 seed archive that single-stage warm-starts from.
 STAGE2_SEED_STORE = Path(
-    os.environ.get("STAGE2_SEED_DIR", str(Path(__file__).resolve().parents[1] / "stage2_seeds"))
+    os.environ.get("STAGE2_SEED_DIR", str(Path(__file__).resolve().parents[2] / "stage2_seeds"))
 )
 
 # Single-stage runs Poincaré validation only when the field error clears this
@@ -278,50 +279,6 @@ def _build_cli(args: argparse.Namespace, plasma_surf: str, run_dir: Path) -> lis
     return common + mode_args + ["--output-root", str(run_dir)]
 
 
-def _extract_params(args: argparse.Namespace) -> dict:
-    """Collect the agent-set solver knobs for this run into a flat dict."""
-    shared = {
-        "cc_weight": args.cc_weight,
-        "curvature_weight": args.curvature_weight,
-        "curvature_threshold": args.curvature_threshold,
-        "banana_surf_radius": args.banana_surf_radius,
-        "major_radius": args.major_radius,
-        "toroidal_flux": args.toroidal_flux,
-        "order": args.order,
-        "maxiter": args.maxiter,
-        "nphi": args.nphi,
-        "ntheta": args.ntheta,
-    }
-    if args.solver == "stage2":
-        shared.update({
-            "cc_threshold": args.cc_threshold,
-            "length_weight": args.length_weight,
-            "length_target": args.length_target,
-            "squared_flux_weight": args.squared_flux_weight,
-            "curvature_p_norm": args.curvature_p_norm,
-            "num_quadpoints": args.num_quadpoints,
-        })
-    else:
-        shared.update({
-            "iota_target": args.iota_target,
-            "vol_target": args.vol_target,
-            "mpol": args.mpol,
-            "ntor": args.ntor,
-            "cc_dist": args.cc_dist,
-            "constraint_weight": args.constraint_weight,
-            "res_weight": args.res_weight,
-            "iotas_weight": args.iotas_weight,
-            "cs_weight": args.cs_weight,
-            "cs_dist": args.cs_dist,
-            "surf_dist_weight": args.surf_dist_weight,
-            "ss_dist": args.ss_dist,
-            "ss_length_weight": args.ss_length_weight,
-            "maxcor": args.maxcor,
-            "boozer_stage": args.boozer_stage,
-        })
-    return shared
-
-
 # --- Result interpretation --------------------------------------------------
 
 def _map_metrics(raw: dict) -> dict:
@@ -449,8 +406,6 @@ def _archive_stage2_seed(run_dir: Path, plasma_surf: str) -> None:
 
 def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome:
     """Run one banana experiment end-to-end in run_dir; return its outcome."""
-    params = _extract_params(args)
-
     solver_root = Path(args.solver_root) if args.solver_root else DEFAULT_SOLVER_ROOT
     solver_python = args.solver_python or DEFAULT_SOLVER_PYTHON
     solver_script = solver_root / SCRIPTS[args.solver]
@@ -458,11 +413,11 @@ def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome
     try:
         plasma_surf = _resolve_equilibrium(args.equilibrium)
     except KeyError:
-        return ExperimentOutcome("crash", "unknown_equilibrium", params=params)
+        return ExperimentOutcome("crash", "unknown_equilibrium")
 
     cli_args = _build_cli(args, plasma_surf, run_dir)
     if cli_args is None:
-        return ExperimentOutcome("crash", "no_seed", params=params)
+        return ExperimentOutcome("crash", "no_seed")
 
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.omp_threads)
@@ -476,18 +431,18 @@ def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome
                 cmd, stdout=lf, stderr=subprocess.STDOUT, env=env, timeout=args.timeout,
             )
     except subprocess.TimeoutExpired:
-        return ExperimentOutcome("crash", "timeout", params=params)
+        return ExperimentOutcome("crash", "timeout")
     if result.returncode != 0:
-        return ExperimentOutcome("crash", f"exit_{result.returncode}", params=params)
+        return ExperimentOutcome("crash", f"exit_{result.returncode}")
 
     results_files = list(run_dir.rglob("results.json"))
     if not results_files:
-        return ExperimentOutcome("crash", "no_results_json", params=params)
+        return ExperimentOutcome("crash", "no_results_json")
     try:
         with open(results_files[0]) as f:
             raw = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        return ExperimentOutcome("crash", f"bad_results_json: {e}", params=params)
+        return ExperimentOutcome("crash", f"bad_results_json: {e}")
 
     metrics = _map_metrics(raw)
     status, status_reason = _classify(metrics, args.solver)
@@ -511,6 +466,5 @@ def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome
         status=status,
         status_reason=status_reason,
         metrics=metrics,
-        params=params,
         validated=validated,
     )

@@ -1,10 +1,11 @@
 [project]
 name = "autoresearch"
 version = "0.1.0"
-description = "Autonomous AI research harness for stellarator coil optimization"
+description = "Solver-agnostic autonomous research harness for optimization campaigns"
 readme = "README.md"
 requires-python = ">=3.10"
-# The harness itself (run.py, tests) is stdlib-only. Solver dependencies
-# (simsopt etc.) live in the interpreter pointed to by SIMSOPT_PYTHON,
-# not in this project's environment.
+# The harness itself (run.py, the toy reference adapter, tests) is
+# stdlib-only. Solver dependencies live in the interpreter each adapter
+# invokes (named in the campaign's config.json), not in this project's
+# environment.
 dependencies = []

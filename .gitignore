@@ -19,6 +19,14 @@ results.db-wal
 stage2_seeds/
 *.sqlite
 
+# Campaign runtime data and machine-specific campaign config
+campaigns/*/config.json
+campaigns/*/results.db
+campaigns/*/results.db-shm
+campaigns/*/results.db-wal
+campaigns/*/results.jsonl
+campaigns/*/artifacts/
+
 # Environment (machine-specific paths)
 .env
 .solver_config.json

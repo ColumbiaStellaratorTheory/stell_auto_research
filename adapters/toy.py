@@ -1,0 +1,94 @@
+"""Toy solver adapter — the reference implementation of the harness contract.
+
+Implements contract.py for `examples/toy_solver.py`, a stdlib-only optimizer
+on classic test functions (sphere, rosenbrock, rastrigin). It needs no physics
+stack, so it runs on any machine and serves as the test fixture and as the
+template `/setup-harness` copies when generating an adapter for a real solver.
+
+The shape to copy: register the solver's flags, run it as a subprocess in
+run_dir with a timeout, parse its results file, map native keys onto
+canonical metric keys, and classify the run — never raising for a solver
+failure. `examples/banana/simsopt_banana.py` shows the same contract for a
+real two-mode physics solver with a warm-start seed store and validation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import subprocess
+import sys
+from pathlib import Path
+
+from contract import ExperimentOutcome
+
+# --- Contract surface -------------------------------------------------------
+
+NAME = "toy"
+SOLVER_MODES = ("optimize",)
+TARGET_FLAG = "problem"
+ENV_REQUIREMENTS = ()
+
+SOLVER_SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "toy_solver.py"
+
+
+# --- CLI flags --------------------------------------------------------------
+
+def add_arguments(p: argparse.ArgumentParser) -> None:
+    """Register the toy solver's CLI flags on the harness parser."""
+    p.add_argument("--problem", choices=("sphere", "rosenbrock", "rastrigin"), default="rosenbrock")
+    p.add_argument("--dim", type=int, default=2)
+    p.add_argument("--maxiter", type=int, default=2000)
+    p.add_argument("--step-size", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--noise", type=float, default=0.0, help="std dev of evaluation noise the search sees")
+    p.add_argument(
+        "--inject",
+        choices=("none", "crash", "hang", "nan"),
+        default="none",
+        help="deliberate failure, for exercising the harness",
+    )
+    p.add_argument("--timeout", type=int, default=60)
+
+
+# --- Experiment entry point -------------------------------------------------
+
+def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome:
+    """Run one toy optimization in run_dir; return its outcome."""
+    results_path = run_dir / "results.json"
+    cmd = [
+        sys.executable, str(SOLVER_SCRIPT),
+        "--problem", args.problem,
+        "--dim", str(args.dim),
+        "--maxiter", str(args.maxiter),
+        "--step-size", str(args.step_size),
+        "--seed", str(args.seed),
+        "--noise", str(args.noise),
+        "--inject", args.inject,
+        "--output", str(results_path),
+    ]
+    try:
+        with open(run_dir / "run.log", "w") as log:
+            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return ExperimentOutcome("crash", "timeout")
+    if result.returncode != 0:
+        return ExperimentOutcome("crash", f"exit_{result.returncode}")
+    try:
+        raw = json.loads(results_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return ExperimentOutcome("crash", f"bad_results_json: {e}")
+
+    metrics = {
+        "iterations": raw.get("evaluations"),
+        "optimizer_success": raw.get("converged"),
+        "objective_J": raw.get("objective"),
+        # no dedicated column → preserved in the metrics JSON overflow
+        "distance_to_optimum": raw.get("distance_to_optimum"),
+        "final_step": raw.get("final_step"),
+    }
+    objective = metrics["objective_J"]
+    if not isinstance(objective, float) or not math.isfinite(objective):
+        return ExperimentOutcome("fail", "incomplete_metrics", metrics=metrics)
+    return ExperimentOutcome("pass", "ok", metrics=metrics)

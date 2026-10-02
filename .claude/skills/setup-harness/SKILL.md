@@ -1,6 +1,6 @@
 ---
 name: setup-harness
-description: Interactive first-time setup of the autoresearch harness for the user's own optimizer (simsopt, DESC, or any other). Detects their solver stack, installs missing dependencies, generates a solver adapter + campaign program file, and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to regenerate the program file for a new campaign.
+description: Interactive first-time setup of the autoresearch harness for the user's own optimizer (simsopt, DESC, or any other). Detects their solver stack, installs missing dependencies, generates a solver adapter + campaign folder (config, program file, lessons), and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to regenerate the program file for a new campaign.
 ---
 
 # setup-harness
@@ -11,11 +11,12 @@ that. It runs their parameter scans, records every run (and every failure) in a
 queryable SQLite DB, and keeps an append-only `LESSONS.md`. Your job here is to
 wire it to their solver and prove it runs.
 
-The end state is five pieces, all verified by a real run:
-**adapter** (`adapter.py` → `adapters/<solver>.py`, the solver-specific glue) +
-**program file** (`program_<slug>.md`, the agent's instructions) + **run.py**
-(generic runner, untouched) + **results.db/jsonl** (experiment DB) +
-**LESSONS.md** (research memory).
+The end state is these pieces, all verified by a real run:
+**adapter** (`adapters/<solver>.py`, the solver-specific glue) + **campaign
+folder** `campaigns/<slug>/` holding `config.json` (which adapter + its
+settings), `program.md` (the agent's instructions) and `LESSONS.md` (research
+memory) + **run.py** (generic runner, untouched) + the campaign's
+**results.db/jsonl** (experiment DB, created by the first run).
 
 Run the phases in order. Be concrete, verify every step, and do not declare
 done on a red smoke run. The user may be new to autoresearch and skeptical that
@@ -28,16 +29,21 @@ Read these before asking anything:
 1. `contract.py` — the harness↔adapter contract. This is the interface the
    generated adapter must implement (`NAME`, `SOLVER_MODES`, `ENV_REQUIREMENTS`,
    `add_arguments`, `run_experiment`) and the `ExperimentOutcome` it returns.
-2. `run.py` — the generic core: how it calls the adapter, the CLI skeleton, the
-   env/artifact layout (`OUTPUT_BASE` / `KEEP_ARTIFACTS` / `ARTIFACTS_DIR`), and
-   `COLUMN_METRIC_KEYS` (the canonical metric keys that get their own DB column;
-   everything else an adapter emits lands in the `metrics` JSON overflow).
-3. `adapters/simsopt_banana.py` — the **reference adapter**: a complete worked
+2. `run.py` — the generic core: campaign selection (`--campaign`, one folder
+   per campaign under `campaigns/`), `config.json` (`adapter` + `env`), how it
+   calls the adapter, the artifact layout (`OUTPUT_BASE` / `KEEP_ARTIFACTS` /
+   `ARTIFACTS_DIR`), and `COLUMN_METRIC_KEYS` (the canonical metric keys that
+   get their own DB column; everything else an adapter emits lands in the
+   `metrics` JSON overflow). The core records every parsed flag of a run.
+3. `adapters/toy.py` — the **reference adapter**: a complete, stdlib-only
    example of the contract. You will model the generated adapter on this.
-4. `templates/program_template.md` — the program-file skeleton you fill later.
+   `examples/banana/simsopt_banana.py` is a real physics adapter showing
+   multiple modes, a warm-start seed store and independent validation.
+4. `templates/program_template.md` and `templates/LESSONS.md` — the skeletons
+   you fill or copy into the campaign folder later.
 
-Do not read or write dotenv files; the harness is configured from exported
-environment variables.
+Do not read or write dotenv files; adapter settings go in the campaign's
+`config.json` `"env"` map (a variable set in the shell overrides it).
 
 ## Phase 2 — Identify the solver stack
 
@@ -49,10 +55,12 @@ Ask the user (AskUserQuestion, with detected defaults where possible):
   optimizes against (simsopt: `wout_*.nc` equilibria; DESC: base cases / `.h5`).
 
 Verify each path immediately (dir exists; interpreter runs). If the user's
-optimizer **is** the banana/simsopt reference, no adapter generation is needed —
-set `AUTORESEARCH_ADAPTER=simsopt_banana`, skip Phase 6's adapter step, and just
-do dependency check + campaign identity + program generation + smoke. Otherwise
-you will generate a new adapter for their solver.
+optimizer **is** the banana/simsopt example, no adapter generation is needed —
+use `"adapter": "examples.banana.simsopt_banana"` (see
+`examples/banana/config.example.json` and `examples/banana/README.md`), skip
+Phase 6's adapter step, and just do dependency check + campaign identity +
+campaign folder + smoke. Otherwise you will generate a new adapter for their
+solver.
 
 ## Phase 3 — Dependencies (hard gate before introspection)
 
@@ -87,7 +95,7 @@ You are about to write an adapter; learn the solver's shape first.
    each onto a canonical snake_case key. Keys in `run.py`'s `COLUMN_METRIC_KEYS`
    get a dedicated column; everything else is preserved in the `metrics` JSON
    blob (so nothing is lost — no schema change needed).
-5. **Target-configuration resolution**: how a `--equilibrium`/base-case key maps
+5. **Target-configuration resolution**: how the target flag (`--equilibrium`, a base-case key, …) maps
    to an actual input file or case.
 6. **Validation / intermediates**: any independent check (field-line tracing,
    convergence) that should set `validated`, and any expensive intermediate a
@@ -97,7 +105,9 @@ You are about to write an adapter; learn the solver's shape first.
 
 Free-text, the user's physics, not yours. Keep it lean — guardrails remove agent
 freedom; physics findings belong in `LESSONS.md`, not here.
-- **Campaign title** + 2–5 sentence **mission**.
+- **Campaign title** + 2–5 sentence **mission**, and a short **slug** for the
+  campaign folder (`campaigns/<slug>/`). If campaigns already exist, confirm
+  this is a new goal rather than more runs for an existing campaign.
 - **Success metric**: the one measurable claim that defines success, and how it
   is verified.
 - **Hard invariants**: hardware limits, sign/convention contracts, ceilings.
@@ -121,12 +131,15 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 ## Phase 6 — Generate
 
 1. **Adapter** (`adapters/<solver-slug>.py`) — implement the `contract.py`
-   interface, modeling `adapters/simsopt_banana.py`:
+   interface, modeling `adapters/toy.py`:
    - `NAME`, `SOLVER_MODES` (the `--solver` choices; a single-shot solver has
-     one mode, a pipeline may expose several), `ENV_REQUIREMENTS`.
-   - `add_arguments(parser)` — register `--equilibrium` plus every solver param
-     the agent may set, with the solver's real defaults. Only flags the solver
-     actually supports.
+     one mode, a pipeline may expose several), `TARGET_FLAG` (the argparse
+     dest of the flag naming the target configuration, e.g. `"equilibrium"`),
+     `ENV_REQUIREMENTS`.
+   - `add_arguments(parser)` — register the target flag (with a default) plus
+     every solver param the agent may set, with the solver's real defaults.
+     Only flags the solver actually supports. The core records every flag, so
+     there is no list of "kept" params to maintain.
    - `run_experiment(args, run_dir)` — run one experiment end-to-end (one
      subprocess, or the full chain), parse outputs, map metrics → canonical keys,
      classify pass/fail, run any validation, archive any reusable intermediate,
@@ -134,27 +147,27 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      a `crash`/`fail` outcome (the core catches truly-unexpected exceptions).
      For per-step granularity, emit one outcome per step with `experiment_group`.
    - Read config via `require_env` from `contract.py` (fail-fast at import).
-   - Do **not** edit `adapter.py` or `run.py` — the adapter is selected by the
-     `AUTORESEARCH_ADAPTER` env var (next step).
-2. **Environment exports** — shell `export` commands from the interview:
-   `AUTORESEARCH_ADAPTER=<your-adapter-module>` (selects the adapter), plus the
-   solver root, interpreter, config dir, and any non-default artifact-layout
-   values. Omit anything left at default.
-3. **`program_<campaign-slug>.md`** — fill every `{{PLACEHOLDER}}` in
+   - Do **not** edit `adapter.py` or `run.py` — the campaign's `config.json`
+     selects the adapter (next step).
+2. **`campaigns/<slug>/config.json`** — `{"adapter": "<module>", "env": {...}}`
+   from the interview: the adapter module name, plus the solver root,
+   interpreter, config dir, and any non-default artifact-layout values in
+   `env`. Omit anything left at default. No shell exports are needed.
+3. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
    `templates/program_template.md` from the interview + introspection:
    parameter table (only real flags), target-configuration table, artifact
    layout, success metric, hard invariants, constraint floors. Leave deferred
    sections as short "TODO — fill in as lessons accumulate" notes; do not invent
    physics. Remove all template HTML comments from the generated file.
-4. **`LESSONS.md`** — shipped with the repo; do not overwrite. If missing,
-   restore the scaffold from git.
+4. **`campaigns/<slug>/LESSONS.md`** — copy `templates/LESSONS.md`. Never
+   overwrite an existing campaign's `LESSONS.md`.
 
 ## Phase 7 — Verify (must end green)
 
-1. Run one tiny experiment through `run.py` with the env exports active and the
+1. Run one tiny experiment with `python run.py --campaign <slug> ...` and the
    smallest meaningful settings (low iterations/resolution, short timeout).
    Expect a single JSON line with a `"status"` and a new row in both
-   `results.jsonl` and `results.db`.
+   `campaigns/<slug>/results.jsonl` and `campaigns/<slug>/results.db`.
 2. If it crashes, read the run log (path printed in stderr / under
    `OUTPUT_BASE`), diagnose (usually a missing dep, an adapter↔solver flag
    mismatch, target-config resolution, or a broken pipeline step), fix, re-run.
@@ -167,16 +180,14 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 ## Phase 8 — Report & how to run
 
 Print a short, practical summary:
-- The adapter written (`adapters/<slug>.py`), selected via
-  `AUTORESEARCH_ADAPTER`; the program file (`program_<slug>.md`).
-- The environment variables that must be exported before running, as a copy-paste
-  block.
+- The adapter written (`adapters/<slug>.py`) and the campaign folder
+  (`campaigns/<slug>/`: `config.json`, `program.md`, `LESSONS.md`).
 - Any adapter↔solver flag drift found and how it was resolved.
 - **The first real launch command**, e.g.
-  `python run.py --solver <mode> --equilibrium <case> [params]`.
-- **How to start the loop**: "Read `program_<slug>.md`, then start the
-  optimization loop."
+  `python run.py --campaign <slug> --solver <mode> --<target-flag> <case> [params]`.
+- **How to start the loop**: "Read `campaigns/<slug>/program.md`, then start
+  the optimization loop."
 - Reminders: `LESSONS.md` is append-only memory; the program file is the
-  contract; query results with `sqlite3 results.db`; re-run `/setup-harness` for
-  a new campaign or solver (it generates under a new slug / adapter rather than
-  overwriting).
+  contract; query results with `sqlite3 campaigns/<slug>/results.db`; re-run
+  `/setup-harness` for a new campaign or solver (it creates a new campaign
+  folder / adapter rather than overwriting).

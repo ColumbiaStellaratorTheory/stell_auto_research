@@ -46,14 +46,14 @@ here is a research variable.
 ## Setup
 
 1. Read this file completely.
-2. Read `LESSONS.md` — it is your accumulated research memory.
+2. Read `LESSONS.md` (next to this file) — it is your accumulated research memory.
 3. Query the database to understand what has been tried.
 4. Start the loop.
 
 ## Solver Modes
 
 The `--solver` flag selects a mode exposed by the solver adapter. Run
-`python run.py --help` to see the modes and their flags.
+`python run.py --campaign {{CAMPAIGN_SLUG}} --help` to see the modes and their flags.
 
 {{SOLVER_MODES}}
 <!-- Describe each --solver mode: what it optimizes, rough cost, when to use,
@@ -70,21 +70,21 @@ source directly is encouraged when a metric or crash is ambiguous.)
 
 ```bash
 # Default mode
-python run.py --equilibrium {{EXAMPLE_EQUILIBRIUM}} [params]
+python run.py --campaign {{CAMPAIGN_SLUG}} --{{TARGET_FLAG}} {{EXAMPLE_TARGET}} [params]
 
 # A specific mode
-python run.py --solver {{EXAMPLE_SOLVER_MODE}} --equilibrium {{EXAMPLE_EQUILIBRIUM}} \
+python run.py --campaign {{CAMPAIGN_SLUG}} --solver {{EXAMPLE_SOLVER_MODE}} --{{TARGET_FLAG}} {{EXAMPLE_TARGET}} \
     {{EXAMPLE_MODE_PARAMS}} --timeout {{EXAMPLE_TIMEOUT}}
 ```
 
-Output: one JSON line to stdout, auto-written to both `results.jsonl` and
-`results.db`.
+Output: one JSON line to stdout, auto-written to both this campaign's
+`results.jsonl` and `results.db`.
 
 ### Parameters
 
 {{PARAMETER_TABLE}}
 <!-- List every flag the adapter exposes, with defaults and sane ranges.
-     Generate from `python run.py --help` cross-checked against the adapter's
+     Generate from `python run.py --campaign {{CAMPAIGN_SLUG}} --help` cross-checked against the adapter's
      add_arguments and the underlying solver's argparse. -->
 
 Every parameter is yours to set. Defaults are starting points, not
@@ -98,12 +98,12 @@ Enforced limits — do not go below/above:
 <!-- e.g. curvature_threshold >= X, cc_dist >= Y m, length_target >= Z m.
      These come from your hardware/buildability contract. -->
 
-## Target Configurations (`--equilibrium`)
+## Target Configurations (`--{{TARGET_FLAG}}`)
 
 {{EQUILIBRIA_TABLE}}
 <!-- Table of available target configurations the adapter resolves: registry
      key or filename, plus the properties that matter for this campaign and
-     provenance. `--equilibrium` is whatever the adapter's resolver accepts. -->
+     provenance. The target flag accepts whatever the adapter's resolver accepts. -->
 
 ## Artifacts & Directories
 
@@ -115,17 +115,17 @@ Enforced limits — do not go below/above:
      - ARTIFACTS_DIR + KEEP_ARTIFACTS policy: where completed runs' outputs
        are kept, named by run id (joins to results.db id)
      - any seed/intermediate store the adapter reuses across runs
-     - results.db / results.jsonl: repo root -->
+     - results.db / results.jsonl: campaigns/{{CAMPAIGN_SLUG}}/ -->
 
 When you cite a champion in `LESSONS.md`, reference its artifact dir by run
 id so the result stays reproducible.
 
 ## Querying Results
 
-Query `results.db` directly with sqlite3. You have full SQL access.
+Query this campaign's `results.db` directly with sqlite3. You have full SQL access.
 
 ```bash
-sqlite3 results.db -header -column "YOUR QUERY"
+sqlite3 campaigns/{{CAMPAIGN_SLUG}}/results.db -header -column "YOUR QUERY"
 ```
 
 ### Schema
@@ -141,11 +141,12 @@ runs(
   coil_length, coil_coil_dist, coil_surface_dist, surface_vessel_dist,
   max_force, self_intersecting, objective_J,
   metrics,  -- JSON: solver-specific metrics with no column; json_extract(metrics, '$.key')
-  params    -- JSON: the params set for the run; json_extract(params, '$.key')
+  params    -- JSON: every flag of the run, defaults included; json_extract(params, '$.key')
 )
 ```
 
-`coil_type` = the solver family; `experiment_group` ties together rows of one
+`coil_type` = the solver family; `equilibrium` = the value of the target flag
+(`--{{TARGET_FLAG}}`); `experiment_group` ties together rows of one
 multi-step experiment (NULL when one experiment is one row). Metrics with a
 dedicated column above are common across solvers; anything specific to this
 solver is preserved in the `metrics` JSON blob.
@@ -198,7 +199,7 @@ suggests a better way to spend the next experiment:
 2. **Think**: What is the objective rewarding? Why did that config fail?
    What does `LESSONS.md` say about this region?
 3. **Check**: Has this exact configuration been run before?
-4. **Run**: `python run.py --solver ... --equilibrium ... [params]`
+4. **Run**: `python run.py --campaign {{CAMPAIGN_SLUG}} --solver ... [params]`
 5. **Evaluate**: Read the JSON output. Compare against the frontier.
 6. **Record**: If the result generalizes, append to `LESSONS.md`.
 7. **Repeat.**

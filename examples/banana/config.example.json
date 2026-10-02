@@ -1,0 +1,8 @@
+{
+  "adapter": "examples.banana.simsopt_banana",
+  "env": {
+    "SIMSOPT_ROOT": "/path/to/your/simsopt",
+    "SIMSOPT_PYTHON": "/path/to/conda/envs/simsopt/bin/python",
+    "EQUILIBRIA_DIR": "/path/to/equilibria"
+  }
+}

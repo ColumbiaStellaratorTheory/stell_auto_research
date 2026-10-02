@@ -40,14 +40,14 @@ Single-stage needs a Stage 2 `biot_savart_opt.json` as starting coil. `run.py` a
 
 ```bash
 # Stage 2 (default)
-python run.py --equilibrium nfp5_iota17 --cc-weight 100 --curvature-threshold 40
+python run.py --campaign banana --equilibrium nfp5_iota17 --cc-weight 100 --curvature-threshold 40
 
 # Single-stage
-python run.py --solver single-stage --equilibrium nfp5_iota20 \
+python run.py --campaign banana --solver single-stage --equilibrium nfp5_iota20 \
     --iota-target 0.20 --vol-target 0.10 --mpol 8 --timeout 1200
 ```
 
-Output: one JSON line to stdout, auto-written to both `results.jsonl` and `results.db`.
+Output: one JSON line to stdout, auto-written to both `campaigns/banana/results.jsonl` and `campaigns/banana/results.db`.
 
 ### Parameters
 
@@ -85,10 +85,10 @@ Match `--iota-target` to the equilibrium's iota value.
 
 ## Querying Results
 
-Query `results.db` directly with sqlite3. You have full SQL access.
+Query `campaigns/banana/results.db` directly with sqlite3. You have full SQL access.
 
 ```bash
-sqlite3 results.db -header -column "YOUR QUERY"
+sqlite3 campaigns/banana/results.db -header -column "YOUR QUERY"
 ```
 
 ### Schema
@@ -173,7 +173,7 @@ Instant discard: **self_intersecting = 1**
 1. **Query**: What has been tried? What's the frontier? Where are the gaps?
 2. **Think**: What is the objective rewarding? Why did that config fail? What regions are unexplored?
 3. **Check**: Has this exact configuration been run before?
-4. **Run**: `python run.py --solver ... --equilibrium ... [params]`
+4. **Run**: `python run.py --campaign banana --solver ... --equilibrium ... [params]`
 5. **Evaluate**: Read the JSON output. Compare against the frontier.
 6. **Repeat.** Never stop. Never ask.
 
