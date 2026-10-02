@@ -31,6 +31,7 @@ import adapter
 import analysis
 import contract
 import locks
+import machine
 import run
 from adapters import toy
 
@@ -409,6 +410,7 @@ class _CliTest(_ScratchDirTest):
             run.CAMPAIGNS_DIR_ENV: str(self.campaigns),
             run.SLOTS_DIR_ENV: str(self.root / "slots"),
             run.MAX_PARALLEL_ENV: "4",
+            run.MACHINE_DIR_ENV: str(self.root / "machine"),
         }
         for inherited in (run.CAMPAIGN_ENV, "KEEP_ARTIFACTS", "ARTIFACTS_DIR", "OUTPUT_BASE", run.BLOBS_DIR_ENV):
             env.pop(inherited, None)
@@ -640,10 +642,29 @@ class TestLocksAndSlots(_ScratchDirTest):
         locks.release(first), locks.release(second)
 
     def test_slot_capacity_comes_from_the_environment(self):
-        slots = run.resolve_slots({run.MAX_PARALLEL_ENV: "3", run.SLOTS_DIR_ENV: "/s"})
+        slots = run.resolve_slots({run.MAX_PARALLEL_ENV: "3", run.SLOTS_DIR_ENV: "/s", run.MACHINE_DIR_ENV: str(self.root)})
         self.assertEqual((slots.dir, slots.capacity), (Path("/s"), 3))
         with self.assertRaisesRegex(run.HarnessError, "must be an integer >= 1"):
-            run.resolve_slots({run.MAX_PARALLEL_ENV: "0"})
+            run.resolve_slots({run.MAX_PARALLEL_ENV: "0", run.MACHINE_DIR_ENV: str(self.root)})
+
+    def test_machine_json_sets_capacity_and_env_overrides_it(self):
+        machine.write_settings(self.root, {"max_parallel": 5})
+        environ = {run.MACHINE_DIR_ENV: str(self.root)}
+        self.assertEqual(run.resolve_slots(environ).capacity, 5)
+        self.assertEqual(run.resolve_slots({**environ, run.MAX_PARALLEL_ENV: "2"}).capacity, 2)
+        self.assertEqual(run.resolve_slots(environ).dir, self.root / "slots")
+        self.assertEqual(run.resolve_slots({run.MACHINE_DIR_ENV: str(self.root / "empty")}).capacity, 1)
+
+    def test_busy_slots_counts_held_locks(self):
+        slots = run.Slots(self.root / "slots", 3)
+        held = locks.acquire_slot(slots.dir, slots.capacity)
+        self.addCleanup(locks.release, held)
+        self.assertEqual(run.busy_slots(slots), 1)
+
+    def test_plan_minutes_is_validated(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy", "plan_minutes": 0})
+        with self.assertRaisesRegex(run.CampaignError, "plan_minutes"):
+            run.load_config(d)
 
     def test_campaign_max_parallel_is_validated(self):
         d = _make_campaign(self.root, "c", {"adapter": "toy", "max_parallel": 0})
@@ -744,6 +765,40 @@ class TestBatchEndToEnd(_CliTest):
         out, _ = proc.communicate(timeout=30)
         printed = json.loads(out)
         self.assertEqual((printed["status"], printed["status_reason"]), ("crash", "cancelled"))
+
+
+
+class TestMachineEndToEnd(_CliTest):
+    """machine and schema commands, peak memory, and sizing in the brief."""
+
+    def test_machine_saves_settings_and_reports_campaign_cost(self):
+        self._json("--problem", "sphere", "--maxiter", "100")
+        proc = self._run("machine", "--max-parallel", "3", "--usable-cores", "12")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(machine.read_settings(self.root / "machine"), {"max_parallel": 3, "usable_cores": 12})
+        self.assertIn("usable_cpus:", proc.stdout)
+        self.assertIn("campaign demo:", proc.stdout)
+        self.assertIn("optimize: 1 runs", proc.stdout)
+
+    def test_invalid_machine_setting_is_refused(self):
+        proc = self._run("machine", "--max-parallel", "0")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("must be > 0", proc.stderr)
+
+    def test_schema_lists_columns_and_goals(self):
+        out = self._run("schema").stdout
+        self.assertIn("peak_rss_mb", out)
+        self.assertIn("goals: objective_J↓  distance_to_optimum↓", out)
+
+    @unittest.skipIf(os.name == "nt", "peak memory is POSIX-only")
+    def test_peak_memory_is_recorded_and_brief_suggests_a_batch_size(self):
+        (self.demo / "config.json").write_text(json.dumps({"adapter": "toy", "plan_minutes": 10}))
+        printed = self._json("--problem", "sphere", "--maxiter", "100")
+        record = json.loads((self.demo / "runs" / f"{printed['id']}.json").read_text())
+        self.assertGreater(record["peak_rss_mb"], 0)
+        brief = self._run("brief").stdout
+        self.assertIn("machine: 4 run slots", brief)
+        self.assertIn("batch ≤", brief)
 
 
 if __name__ == "__main__":

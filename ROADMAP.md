@@ -56,10 +56,10 @@ campaign  (one research goal)
 
 ## Step 5 — hardware-aware setup
 
-- [ ] 29. `/setup-harness` detects cores (performance cores on Apple Silicon; SLURM/affinity allocations), RAM, GPUs, scheduler on macOS / Linux / Windows (WSL2); measures run time and peak memory from the smoke run; runs a tiny solver probe per candidate device and only counts devices that work.
-- [ ] 30. Questions: where runs execute, how much of the machine to use, how often to plan the next batch, session budget, campaign shares. Derive: runs at once = min(cores ÷ threads per run, RAM ÷ peak memory, GPU slots); largest batch = runs at once × (planning interval ÷ run time).
-- [ ] 31. Settings in the campaign's gitignored `config.json`; environment variables override. Sets JAX GPU memory variables (`XLA_PYTHON_CLIENT_PREALLOCATE=false` / `XLA_CLIENT_MEM_FRACTION`) when needed.
-- [ ] 32. Metrics and their goals collected in the interview → `METRICS`; `run.py schema` prints the active adapter's view for the program template.
+- [x] 29. `machine.py` + `run.py machine`: OS, usable CPUs (affinity, SLURM), Apple performance cores, memory, GPUs (nvidia-smi, Apple), scheduler; every run records `peak_rss_mb` (schema v5; POSIX `resource`, None on Windows). `/setup-harness` runs it first, fills gaps with OS commands, and probes each candidate device with the solver's framework (float64 where needed) before offering it.
+- [x] 30. Four questions (where runs execute, share of the machine, planning interval, session budget) plus campaign shares when several exist. Sizing in `machine.py`: runs at once = min(cores ÷ threads, memory ÷ peak memory); batch = runs at once × interval ÷ median run time; new contract field `THREADS_FLAG`. Shown by `run.py machine` and at the end of `run.py brief`. (GPU slots are left to the interview: the probe decides whether a device counts.)
+- [x] 31. Machine-wide settings in `~/.autoresearch/machine.json` (`run.py machine --max-parallel/--usable-cores/--usable-memory-gb`; `$AUTORESEARCH_MAX_PARALLEL` overrides); per campaign `plan_minutes`, `max_parallel` and `env` (JAX `XLA_PYTHON_CLIENT_PREALLOCATE` / `XLA_CLIENT_MEM_FRACTION`) in config.json.
+- [x] 32. Metric goals in the interview → `METRICS`; `run.py schema` prints columns, goals and recorded-only metrics for the program template.
 
 ## Step 6 — generic schema (needs sign-off: changes the DB format)
 

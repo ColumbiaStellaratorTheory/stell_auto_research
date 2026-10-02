@@ -154,6 +154,8 @@ of every run, so no flag is ever lost.
 | `python run.py campaigns` | every campaign: adapter, run counts, last run, runs since its front moved |
 | `python run.py import-lessons --from OTHER` | append another campaign's lessons to this one's `LESSONS.md`, marked as priors |
 | `python run.py batch FILE [--parallel N] [--dry-run]` | run a planned batch of experiments (below) |
+| `python run.py machine [--max-parallel N] [--usable-cores C] [--usable-memory-gb M]` | hardware, run slots, measured run cost and sizing; flags save machine settings |
+| `python run.py schema` | DB columns and the adapter's metric goals, for the program file |
 
 A crashed run's `crash_signature` is the line in its log that names the failure
 (the last `...Error:` line, else the last line), with paths and numbers
@@ -200,10 +202,29 @@ finishes. The format is documented at the top of `batch.py`:
 ## Machine budget
 
 Every run, from every campaign, holds one of the machine's run slots while it
-executes (`AUTORESEARCH_MAX_PARALLEL`, default 1; lock files under
-`~/.autoresearch/slots`), so the machine is never oversubscribed however many
-agents and batches run at once. A campaign's `config.json` may cap its own
-batches with `"max_parallel": N`. Slots are released by the OS if a run dies.
+executes, so the machine is never oversubscribed however many agents and
+batches run at once. Slots are lock files under `~/.autoresearch/slots`,
+released by the OS if a run dies.
+
+`python run.py machine` shows what the harness sees and what fits:
+
+- **hardware** — OS, usable CPUs (affinity and SLURM aware), performance
+  cores on Apple Silicon, memory, GPUs (nvidia-smi; Apple's shared-memory GPU),
+  scheduler;
+- **settings** — `~/.autoresearch/machine.json` (`max_parallel`,
+  `usable_cores`, `usable_memory_gb`), written by the same command:
+  `python run.py machine --max-parallel 6 --usable-cores 60 --usable-memory-gb 100`;
+- **per campaign and mode** — median run time, peak memory and threads of the
+  recorded runs, how many fit at once (`usable cores ÷ threads`, capped by
+  `usable memory ÷ peak memory`), and, with `"plan_minutes"` in the
+  campaign's config, the batch size that fills one planning interval
+  (`runs at once × planning interval ÷ run time`).
+
+Slot capacity: `$AUTORESEARCH_MAX_PARALLEL`, else `machine.json`, else 1. A
+campaign's `config.json` may cap its own batches with `"max_parallel": N`.
+`run.py brief` repeats the per-mode sizing for its campaign. `/setup-harness`
+asks four questions (where runs execute, how much of the machine to use, how
+often to plan, session budget) and fills all of this in.
 
 ## Environment variables
 
@@ -213,6 +234,7 @@ batches with `"max_parallel": N`. Slots are released by the OS if a run dies.
 | `AUTORESEARCH_CAMPAIGNS_DIR` | *(optional)* where campaigns live (default `<repo>/campaigns`). |
 | `AUTORESEARCH_MAX_PARALLEL` | *(optional)* machine-wide run slots (default 1). |
 | `AUTORESEARCH_SLOTS_DIR` | *(optional)* where the slot lock files live (default `~/.autoresearch/slots`). |
+| `AUTORESEARCH_MACHINE_DIR` | *(optional)* machine-wide state: `machine.json` and slots (default `~/.autoresearch`). |
 | `AUTORESEARCH_BLOBS_DIR` | *(optional)* one evidence store shared by every campaign (default: each campaign's `blobs/`). |
 | `OUTPUT_BASE` | *(optional)* scratch dir for live runs (default `campaigns/<name>/scratch`). |
 | `KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `ARTIFACTS_DIR/<run-id>`. |
@@ -274,6 +296,7 @@ run.py                          ← generic experiment runner (solver-agnostic)
 analysis.py                     ← derived views: crash signatures, Pareto fronts, the brief
 batch.py                        ← batch files: validation, spec expansion, promotion, early stop
 locks.py                        ← OS-released file locks for run slots and spec claims
+machine.py                      ← hardware detection, peak memory, run-slot and batch sizing
 adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)

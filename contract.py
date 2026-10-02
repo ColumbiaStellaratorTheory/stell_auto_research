@@ -26,6 +26,10 @@ An adapter is a module exposing:
                                      executes but not what it computes (timeout,
                                      thread count, solver location). Recorded,
                                      but excluded from the spec hash.
+    THREADS_FLAG      str | None   — argparse dest of the flag setting threads
+                                     per run (e.g. "omp_threads"), or None for
+                                     a single-threaded solver. Used to size how
+                                     many runs fit on the machine at once.
     SEED_FLAG         str | None   — argparse dest of the solver's RNG seed
                                      flag (default None), or None for a
                                      deterministic solver. When the agent leaves

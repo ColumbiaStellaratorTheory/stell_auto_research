@@ -47,6 +47,7 @@ REQUIRED_ENV = ("SIMSOPT_ROOT", "SIMSOPT_PYTHON", "EQUILIBRIA_DIR")
 OPTIONAL_ENV = ("STAGE2_SCRIPT", "SINGLE_STAGE_SCRIPT", "POINCARE_SCRIPT", "STAGE2_SEED_DIR")
 EXECUTION_FLAGS = ("timeout", "omp_threads", "solver_root", "solver_python")
 SEED_FLAG = "basin_seed"
+THREADS_FLAG = "omp_threads"
 # Starting value, not measured: OpenMP reductions make L-BFGS runs differ in the
 # last digits between repeats. Calibrate it by replaying a few runs.
 REPLAY_TOLERANCE = 1e-6

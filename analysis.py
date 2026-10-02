@@ -194,15 +194,20 @@ def render_brief(
     runs: Sequence[Mapping],
     metric_goals: Mapping[str, str | None],
     lessons: Sequence[str],
+    machine_lines: Sequence[str] = (),
 ) -> str:
-    """A fixed-size text digest of the campaign for the start of each loop iteration."""
+    """A fixed-size text digest of the campaign for the start of each loop iteration.
+
+    `machine_lines` (run slots, measured cost per mode, suggested batch size)
+    are appended as given.
+    """
     counts = _status_counts(runs)
     head = (
         f"campaign {campaign} · adapter {adapter_name} · {len(runs)} runs: "
         f"{counts['pass']} pass, {counts['fail']} fail, {counts['crash']} crash"
     )
     if not runs:
-        return head + "\nno runs yet"
+        return "\n".join([head, "no runs yet", *machine_lines])
     lines = [head + f" · last {max(r['created_at'] for r in runs)[:19]}"]
     goals_all = active_goals(runs, metric_goals)
     if goals_all:
@@ -264,4 +269,5 @@ def render_brief(
         lines.append(f"lessons: {len(lessons)} entries; latest: {shown}")
     else:
         lines.append("lessons: none yet")
+    lines.extend(machine_lines)
     return "\n".join(lines)

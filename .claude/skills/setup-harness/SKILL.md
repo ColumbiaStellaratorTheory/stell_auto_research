@@ -121,8 +121,34 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   real physical/hardware limits.
 - **Constraint floors**: the buildability limits (offer the adapter's defaults
   as baseline).
-- **Execution policy**: timeout and thread count for this machine; autonomy
-  ("never stop" loop vs bounded sessions).
+- **Hardware and run budget.** First run `python run.py machine` and show the
+  user what it detected (OS, usable CPUs, performance cores on Apple Silicon,
+  memory, GPUs, SLURM). Fill gaps with OS-native commands only when needed
+  (Windows: PowerShell `Get-CimInstance Win32_ComputerSystem`; AMD:
+  `rocm-smi`). Then ask, with the detected values as defaults:
+  1. **Where do runs execute?** this machine / a SLURM cluster / cloud GPUs.
+     Native Windows: recommend WSL2 (no native JAX GPU; most compiled solvers
+     target Linux/macOS).
+  2. **How much of the machine may the harness use?** all of it / leave
+     headroom on a shared box / a fixed number of cores and GB.
+  3. **How often should the agent look at results and plan the next batch?**
+     e.g. every 30 min / 2 h / overnight. Becomes `plan_minutes`.
+  4. **Session budget?** hours or runs before the loop stops. Goes into the
+     program file's autonomy policy.
+  If other campaigns already exist (`python run.py campaigns`), also ask
+  **how this campaign shares the machine** — becomes its `max_parallel` cap.
+  Also ask the solver's threads per run and timeout per mode.
+- **Devices the solver can actually use.** Do not count a GPU because it
+  exists: run a tiny probe of the solver's framework on each candidate device
+  in the solver's interpreter (JAX: `python -c "import jax, jax.numpy as jnp;
+  jax.config.update('jax_enable_x64', True); print(jax.devices(),
+  jnp.ones(3).sum())"`; check float64 if the solver needs it — DESC does).
+  Only devices that pass are offered. Several JAX runs per GPU need
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` (or a smaller
+  `XLA_CLIENT_MEM_FRACTION`) in the campaign's `env`, since JAX takes 75% of
+  GPU memory at its first operation. On Apple Silicon the GPU shares RAM
+  with the CPU: one memory budget, not two.
+- **Autonomy**: "never stop" loop vs bounded sessions.
 - **Artifact layout**: `OUTPUT_BASE` (scratch, default `campaigns/<slug>/scratch`),
   `KEEP_ARTIFACTS` (`none`/`pass`/`all` — whole run dirs; the adapter's evidence
   files are kept regardless), `ARTIFACTS_DIR`, and any solver-specific
@@ -175,17 +201,27 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      import: every registered adapter is imported on every run.
    - **Register it** in `adapters/__init__.py`: one import line and one
      `REGISTRY` entry. Do **not** edit `adapter.py` or `run.py`.
-2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...}}`
-   from the interview: the adapter's `REGISTRY` key, plus the solver root,
-   interpreter, config dir, and any non-default artifact-layout values in
-   `env`. Omit anything left at default. No shell exports are needed.
-3. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
+2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...},
+   "plan_minutes": P, "max_parallel": N}` from the interview: the adapter's
+   `REGISTRY` key; in `env` the solver root, interpreter, config dir, device
+   settings (e.g. the JAX memory variables) and any non-default
+   artifact-layout values; `plan_minutes` from question 3; `max_parallel`
+   only when the machine is shared between campaigns. Omit anything left at
+   default. No shell exports are needed.
+3. **Machine settings** — `python run.py machine --usable-cores C
+   --usable-memory-gb M --max-parallel N` from question 2. Start
+   `--max-parallel` at `usable cores ÷ threads per run`; Phase 7 refines it
+   with measured memory. These are machine-wide (`~/.autoresearch/machine.json`),
+   shared by every campaign.
+4. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
    `templates/program_template.md` from the interview + introspection:
    parameter table (only real flags), target-configuration table, artifact
-   layout, success metric, hard invariants, constraint floors. Leave deferred
+   layout, success metric, hard invariants, constraint floors, schema and
+   metric goals (`python run.py schema --campaign <slug>`), machine policy
+   (slots, planning interval, budget). Leave deferred
    sections as short "TODO — fill in as lessons accumulate" notes; do not invent
    physics. Remove all template HTML comments from the generated file.
-4. **`campaigns/<slug>/LESSONS.md`** — copy `templates/LESSONS.md`. Never
+5. **`campaigns/<slug>/LESSONS.md`** — copy `templates/LESSONS.md`. Never
    overwrite an existing campaign's `LESSONS.md`.
 
 ## Phase 7 — Verify (must end green)
@@ -202,7 +238,12 @@ freedom; physics findings belong in `LESSONS.md`, not here.
    Do not declare setup done with a failing smoke run.
 3. For a chained pipeline, run one reduced-resolution full parameter set to prove
    every step and the artifact hand-offs work end-to-end.
-4. Leave smoke rows in the DB by default — they are honest history; clean up only
+4. **Size from measurement.** Run one realistic (not reduced) experiment per
+   mode, then `python run.py machine`: it shows each mode's median run time,
+   peak memory and threads, how many runs fit at once, and the batch size per
+   planning interval. If memory, not cores, is the limit, lower
+   `--max-parallel` accordingly; show the user the numbers and confirm.
+5. Leave smoke rows in the DB by default — they are honest history; clean up only
    if the user asks.
 
 ## Phase 8 — Report & how to run
@@ -211,6 +252,9 @@ Print a short, practical summary:
 - The adapter written (`adapters/<slug>.py`) and the campaign folder
   (`campaigns/<slug>/`: `config.json`, `program.md`, `LESSONS.md`).
 - Any adapter↔solver flag drift found and how it was resolved.
+- The machine budget: run slots, runs that fit at once per mode, the
+  suggested batch size per planning interval, and which devices passed the
+  probe.
 - **The first real launch command**, e.g.
   `python run.py --campaign <slug> --solver <mode> --<target-flag> <case> [params]`.
 - **How to start the loop**: "Read `campaigns/<slug>/program.md`, then start

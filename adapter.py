@@ -21,6 +21,7 @@ CONTRACT_MEMBERS = (
     "OPTIONAL_ENV",
     "EXECUTION_FLAGS",
     "SEED_FLAG",
+    "THREADS_FLAG",
     "REPLAY_TOLERANCE",
     "METRICS",
     "add_arguments",

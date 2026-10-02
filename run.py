@@ -16,6 +16,8 @@ Usage (experiment flags come from the campaign's adapter; this shows the toy):
     python run.py campaigns                                        # every campaign at a glance
     python run.py import-lessons --from other --campaign demo      # another campaign's lessons as priors
     python run.py batch plan.json --campaign demo [--dry-run]      # run a planned batch of experiments
+    python run.py machine [--max-parallel N ...]                   # hardware, run slots, run cost, sizing
+    python run.py schema --campaign demo                           # columns + metric goals for program.md
 
 `--campaign` (or $AUTORESEARCH_CAMPAIGN) may be omitted when exactly one
 campaign exists. Each run is written atomically to the campaign's
@@ -48,13 +50,14 @@ from typing import Mapping, MutableMapping
 
 import analysis
 import batch
+import machine
 from adapter import AdapterError, load_adapter
 from contract import Cancelled, ExperimentOutcome, RunContext, clean, git_output, sha256_file
 from locks import acquire_slot, release, report_waiting, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # From this version on every DB row has a run file, so an older DB can be
 # rebuilt from runs/ without losing anything.
 FIRST_RECORD_BACKED_VERSION = 2
@@ -62,11 +65,11 @@ CONFIG_NAME = "config.json"
 CAMPAIGN_ENV = "AUTORESEARCH_CAMPAIGN"
 CAMPAIGNS_DIR_ENV = "AUTORESEARCH_CAMPAIGNS_DIR"
 KEEP_ARTIFACTS_CHOICES = ("none", "pass", "all")
-COMMANDS = ("replay", "rebuild", "brief", "query", "campaigns", "import-lessons", "batch")
+COMMANDS = ("replay", "rebuild", "brief", "query", "campaigns", "import-lessons", "batch", "machine", "schema")
 SLOTS_DIR_ENV = "AUTORESEARCH_SLOTS_DIR"
 MAX_PARALLEL_ENV = "AUTORESEARCH_MAX_PARALLEL"
 BLOBS_DIR_ENV = "AUTORESEARCH_BLOBS_DIR"
-MACHINE_DIR = Path.home() / ".autoresearch"
+MACHINE_DIR_ENV = "AUTORESEARCH_MACHINE_DIR"
 CANCELLED_EXIT = 143
 BATCH_POLL_SECONDS = 0.2
 BATCH_SUMMARY_ROWS = 10
@@ -103,7 +106,7 @@ COLUMN_METRIC_KEYS = (
 IDENTITY_COLUMNS = (
     "id", "coil_type", "solver", "equilibrium", "experiment_group",
     "spec_hash", "replicate", "seed", "parent_run_id", "replay_of", "batch_id",
-    "status", "status_reason", "crash_signature", "validated", "elapsed", "created_at",
+    "status", "status_reason", "crash_signature", "validated", "elapsed", "peak_rss_mb", "created_at",
 )
 JSON_COLUMNS = ("metrics", "params", "provenance", "evidence")
 BOOL_COLUMNS = ("optimizer_success", "self_intersecting")
@@ -116,7 +119,7 @@ SUMMARY_FIELDS = (
 # Run fields the analysis views carry besides metric values.
 VIEW_FIELDS = (
     "id", "solver", "equilibrium", "status", "status_reason", "crash_signature",
-    "validated", "created_at", "replicate", "seed",
+    "validated", "created_at", "replicate", "seed", "elapsed", "peak_rss_mb",
 )
 
 
@@ -140,11 +143,14 @@ class CampaignConfig:
     shell-specific export syntax; a variable already set in the environment
     takes precedence over the config value. `max_parallel` caps how many of
     the machine's run slots one batch of this campaign uses at once.
+    `plan_minutes` is how often the agent plans a new batch; `brief` and
+    `machine` turn it into a suggested batch size.
     """
 
     adapter: str
     env: Mapping[str, str]
     max_parallel: int | None = None
+    plan_minutes: float | None = None
 
 
 def campaigns_root(environ: Mapping[str, str]) -> Path:
@@ -204,7 +210,10 @@ def load_config(campaign_dir: Path) -> CampaignConfig:
     max_parallel = raw.get("max_parallel")
     if max_parallel is not None and (isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1):
         raise CampaignError(f"{path}: \"max_parallel\" must be an integer >= 1")
-    return CampaignConfig(adapter=adapter_name, env=env, max_parallel=max_parallel)
+    plan_minutes = raw.get("plan_minutes")
+    if plan_minutes is not None and (isinstance(plan_minutes, bool) or not isinstance(plan_minutes, (int, float)) or plan_minutes <= 0):
+        raise CampaignError(f"{path}: \"plan_minutes\" must be a number > 0")
+    return CampaignConfig(adapter=adapter_name, env=env, max_parallel=max_parallel, plan_minutes=plan_minutes)
 
 
 @dataclass(frozen=True)
@@ -219,11 +228,30 @@ class Slots:
     capacity: int
 
 
+def machine_dir(environ: Mapping[str, str]) -> Path:
+    """Where machine-wide state lives: machine.json and the slot locks (~/.autoresearch)."""
+    return Path(environ.get(MACHINE_DIR_ENV, str(Path.home() / ".autoresearch")))
+
+
 def resolve_slots(environ: Mapping[str, str]) -> Slots:
-    raw = environ.get(MAX_PARALLEL_ENV, "1")
+    """Slot capacity: $AUTORESEARCH_MAX_PARALLEL, else machine.json's max_parallel, else 1."""
+    configured = machine.read_settings(machine_dir(environ)).get("max_parallel", 1)
+    raw = environ.get(MAX_PARALLEL_ENV, str(configured))
     if not raw.isdigit() or int(raw) < 1:
-        raise HarnessError(f"${MAX_PARALLEL_ENV} must be an integer >= 1, got {raw!r}")
-    return Slots(Path(environ.get(SLOTS_DIR_ENV, str(MACHINE_DIR / "slots"))), int(raw))
+        raise HarnessError(f"run slots must be an integer >= 1, got {raw!r} (${MAX_PARALLEL_ENV} or machine.json)")
+    return Slots(Path(environ.get(SLOTS_DIR_ENV, str(machine_dir(environ) / "slots"))), int(raw))
+
+
+def busy_slots(slots: Slots) -> int:
+    """How many of the machine's slots are held right now."""
+    busy = 0
+    for index in range(slots.capacity):
+        fd = try_lock(slots.dir / f"slot-{index}.lock")
+        if fd is None:
+            busy += 1
+        else:
+            release(fd)
+    return busy
 
 
 def apply_env(defaults: Mapping[str, str], environ: MutableMapping[str, str]) -> None:
@@ -678,8 +706,9 @@ def _read_views(db: sqlite3.Connection, active: ModuleType) -> list[dict]:
         views.append({
             **{k: record[k] for k in VIEW_FIELDS},
             "values": metric_values(record),
-            "spec_base": spec_base(active, json.loads(record["params"] or "{}")),
+            "params": json.loads(record["params"] or "{}"),
         })
+        views[-1]["spec_base"] = spec_base(active, views[-1]["params"])
     return views
 
 
@@ -740,6 +769,7 @@ def execute(
     # Total experiment wall time: includes any validation (e.g. Poincaré) or
     # chained sub-steps the adapter runs internally, not just one solver call.
     elapsed = time.monotonic() - t0
+    peak_rss_mb = machine.children_peak_rss_mb()
 
     evidence = store_evidence(layout.blobs_dir, outcome.evidence)
     record = _build_record(
@@ -747,6 +777,7 @@ def execute(
         run_id=run_id, digest=digest, solver_identity=identity, evidence=evidence,
         crash_signature=_log_signature(outcome), replay_of=replay_of,
     )
+    record["peak_rss_mb"] = round(peak_rss_mb, 1) if peak_rss_mb is not None else None
     write_run_record(layout.runs_dir, record)
     index_record(layout, record)
     _finalize_run_dir(layout, run_dir, outcome.status, run_id)
@@ -858,14 +889,83 @@ def read_lessons(campaign_dir: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
-def brief(active: ModuleType, layout: Layout) -> str:
+def capacity_lines(
+    active: ModuleType, views: list[dict], config: CampaignConfig, environ: Mapping[str, str],
+) -> list[str]:
+    """Measured cost per mode and what fits: runs at once and, with plan_minutes, batch size."""
+    settings = machine.read_settings(machine_dir(environ))
+    cores = settings.get("usable_cores") or machine.usable_cpus(environ)
+    memory = settings.get("usable_memory_gb") or machine.total_memory_gb()
+    slots = resolve_slots(environ)
+    lines = []
+    for cost in machine.mode_costs(views, active.THREADS_FLAG):
+        fit = machine.runs_at_once(cores, cost.threads, memory, cost.peak_memory_gb)
+        parallel = min(fit, slots.capacity, config.max_parallel or slots.capacity)
+        peak = f"{cost.peak_memory_gb:.2f} GB" if cost.peak_memory_gb is not None else "peak memory unknown"
+        line = (
+            f"  {cost.mode}: {cost.runs} runs · median {cost.median_seconds:.3g}s · {peak} · "
+            f"{cost.threads} threads → {fit} fit at once, {parallel} with current slots"
+        )
+        if config.plan_minutes:
+            size = machine.batch_size(parallel, config.plan_minutes, cost.median_seconds)
+            line += f" · batch ≤ {size} per {config.plan_minutes:g} min"
+        lines.append(line)
+    return lines
+
+
+def brief(active: ModuleType, layout: Layout, config: CampaignConfig) -> str:
+    views = load_views(layout, active)
+    slots = resolve_slots(os.environ)
+    machine_lines = [f"machine: {slots.capacity} run slots, {busy_slots(slots)} busy",
+                     *capacity_lines(active, views, config, os.environ)]
     return analysis.render_brief(
         layout.campaign_dir.name,
         active.NAME,
-        load_views(layout, active),
+        views,
         active.METRICS,
         analysis.lesson_titles(read_lessons(layout.campaign_dir)),
+        machine_lines,
     )
+
+
+def machine_report(environ: Mapping[str, str], root: Path) -> str:
+    """Hardware, machine settings, and each campaign's measured run cost with sizing."""
+    hw = machine.detect(environ)
+    slots = resolve_slots(environ)
+    settings = machine.read_settings(machine_dir(environ))
+    lines = ["hardware:", *(f"  {line}" for line in machine.describe_hardware(hw))]
+    shown = ", ".join(f"{k}={v}" for k, v in settings.items()) or "none (defaults: 1 slot, detected cores/memory)"
+    lines.append(f"settings ({machine_dir(environ) / machine.MACHINE_FILE}): {shown}")
+    lines.append(f"run slots: {slots.capacity}, {busy_slots(slots)} busy")
+    for name in list_campaigns(root):
+        campaign_dir = root / name
+        try:
+            config = load_config(campaign_dir)
+            active = load_adapter(config.adapter)
+        except (HarnessError, AdapterError) as e:
+            lines.append(f"campaign {name}: {e}")
+            continue
+        views = _read_views_readonly(campaign_dir, active)
+        plan = f" (plans every {config.plan_minutes:g} min)" if config.plan_minutes else ""
+        lines.append(f"campaign {name}{plan}:")
+        if views is None:
+            lines.append(f"  results.db needs `python run.py rebuild --campaign {name}`")
+            continue
+        lines.extend(capacity_lines(active, views, config, environ) or ["  no runs yet"])
+    return "\n".join(lines)
+
+
+def schema_report(active: ModuleType, campaign: str) -> str:
+    """What the program template's schema and evaluation sections need."""
+    goals = "  ".join(f"{m}{'↓' if g == 'min' else '↑'}" for m, g in active.METRICS.items() if g)
+    recorded = ", ".join(m for m, g in active.METRICS.items() if not g)
+    return "\n".join([
+        f"runs({', '.join(DB_COLUMNS)})",
+        f"metric columns: {', '.join(COLUMN_METRIC_KEYS)}; other metrics: json_extract(metrics, '$.key')",
+        f"goals: {goals or 'none'}",
+        f"recorded only: {recorded or 'none'}",
+        f"flags: python run.py --campaign {campaign} --help",
+    ])
 
 
 def _cell(value: object) -> str:
@@ -894,6 +994,17 @@ def query(layout: Layout, sql: str, limit: int) -> str:
     return "\n".join(lines)
 
 
+def _read_views_readonly(campaign_dir: Path, active: ModuleType) -> list[dict] | None:
+    """A campaign's run views without modifying anything; None if its DB needs a rebuild."""
+    db_path = campaign_dir / "results.db"
+    if not db_path.exists():
+        return []
+    with contextlib.closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as db:
+        if _schema_version(db) != SCHEMA_VERSION:
+            return None
+        return _read_views(db, active)
+
+
 def campaign_status(campaign_dir: Path) -> list[str]:
     """One row of `run.py campaigns` for this campaign, without modifying anything."""
     name = campaign_dir.name
@@ -901,14 +1012,11 @@ def campaign_status(campaign_dir: Path) -> list[str]:
         active = load_adapter(load_config(campaign_dir).adapter)
     except (HarnessError, AdapterError) as e:
         return [name, f"error: {e}", "", "", "", "", "", ""]
-    db_path = campaign_dir / "results.db"
-    if not db_path.exists():
+    views = _read_views_readonly(campaign_dir, active)
+    if views is None:
+        return [name, active.NAME, "outdated schema: run.py rebuild", "", "", "", "", ""]
+    if not views:
         return [name, active.NAME, "0", "0", "0", "0", "-", "-"]
-    with contextlib.closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as db:
-        version = _schema_version(db)
-        if version != SCHEMA_VERSION:
-            return [name, active.NAME, f"schema {version}: run.py rebuild", "", "", "", "", ""]
-        views = _read_views(db, active)
     counts = Counter(v["status"] for v in views)
     last = max((v["created_at"] for v in views), default="-")[:19]
     stall = analysis.runs_since_front_change(views, active.METRICS)
@@ -1209,6 +1317,19 @@ def _dispatch(command: str, argv: list[str]) -> int:
         argparse.ArgumentParser(description="List every campaign").parse_args(argv)
         print(campaigns_table(campaigns_root(os.environ)))
         return 0
+    if command == "machine":
+        p = argparse.ArgumentParser(description="Hardware, run slots, run cost and sizing; flags save settings")
+        p.add_argument("--max-parallel", type=int, help="machine-wide run slots")
+        p.add_argument("--usable-cores", type=int, help="cores the harness may use")
+        p.add_argument("--usable-memory-gb", type=float, help="memory the harness may use")
+        args = p.parse_args(argv)
+        updates = {k: getattr(args, k) for k in machine.MACHINE_KEYS}
+        if any(v is not None and v <= 0 for v in updates.values()):
+            raise HarnessError("machine settings must be > 0")
+        if any(v is not None for v in updates.values()):
+            machine.write_settings(machine_dir(os.environ), updates)
+        print(machine_report(os.environ, campaigns_root(os.environ)))
+        return 0
 
     # Campaign selection comes first: the campaign's adapter defines every
     # other flag, so the full parser can only be built once it is loaded.
@@ -1245,7 +1366,13 @@ def _dispatch(command: str, argv: list[str]) -> int:
         p = argparse.ArgumentParser(description="Fixed-size digest of the campaign")
         p.add_argument("--campaign", default=selection.campaign)
         p.parse_args(argv)
-        print(brief(active, layout))
+        print(brief(active, layout, config))
+        return 0
+    if command == "schema":
+        p = argparse.ArgumentParser(description="Columns and metric goals for the program file")
+        p.add_argument("--campaign", default=selection.campaign)
+        p.parse_args(argv)
+        print(schema_report(active, campaign_dir.name))
         return 0
     if command == "query":
         p = argparse.ArgumentParser(description="Run one read-only SQL statement on results.db")

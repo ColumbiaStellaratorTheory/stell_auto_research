@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS runs (
     validated               TEXT,
     iterations              INTEGER,
     elapsed                 REAL,
+    peak_rss_mb             REAL,            -- peak resident memory of the solver processes (NULL on Windows)
     created_at              TEXT DEFAULT (datetime('now')),
     optimizer_success       INTEGER,
     termination_message     TEXT,

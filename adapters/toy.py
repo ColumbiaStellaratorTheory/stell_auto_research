@@ -34,6 +34,7 @@ REQUIRED_ENV = ()
 OPTIONAL_ENV = ()
 EXECUTION_FLAGS = ("timeout",)
 SEED_FLAG = "seed"
+THREADS_FLAG = None
 # The toy solver is pure Python on one thread: a replay must reproduce the
 # original exactly, up to float printing.
 REPLAY_TOLERANCE = 1e-12

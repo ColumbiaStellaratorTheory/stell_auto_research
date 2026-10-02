@@ -250,5 +250,11 @@ suggests a better way to spend the next experiment:
 ## Machine Policy
 
 {{MACHINE_POLICY}}
-<!-- Thread/parallelism flags the adapter exposes, timeouts, max concurrent
-     heavy runs, disk hygiene, anything scheduler-relevant for this machine. -->
+<!-- From the setup interview: where runs execute, run slots (machine.json),
+     this campaign's max_parallel cap and plan_minutes, threads per run and
+     timeout per mode, which devices passed the probe, session budget.
+     Then point the agent at the live numbers: -->
+
+`python run.py machine` and the last lines of `run.py brief` show the run
+slots, each mode's measured run time and memory, how many runs fit at once,
+and the batch size that fills one planning interval. Size batches from them.
