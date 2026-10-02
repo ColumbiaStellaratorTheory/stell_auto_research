@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
+import io
 import json
 import os
 import shutil
@@ -870,14 +872,18 @@ class TestReviewFixes(_ScratchDirTest):
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
             db.execute("PRAGMA user_version = 2")
+        go = self.root / "go"
         script = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import contextlib, run; from adapters import toy; "
+            "import sys, time; sys.path.insert(0, sys.argv[1]); import run; from adapters import toy; "
             "from pathlib import Path; d = Path(sys.argv[2]); "
             "layout = run.Layout(d, d / 'scratch', d / 'artifacts', 'none'); "
-            "contextlib.closing(run.open_db(layout, toy)).__enter__().close()"
+            "[time.sleep(0.01) for _ in iter(lambda: (d / 'go').exists(), True)]; "
+            "run.open_db(layout, toy).close()"
         )
         procs = [subprocess.Popen([sys.executable, "-c", script, str(REPO_ROOT), str(self.root)],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
+        time.sleep(1)  # let every opener reach the barrier
+        go.touch()
         for proc in procs:
             _, err = proc.communicate(timeout=60)
             self.assertEqual(proc.returncode, 0, err.decode())
@@ -907,7 +913,7 @@ class TestReviewFixes(_ScratchDirTest):
             "print(json.dumps({'id': 'big', 'padding': 'x' * 2_000_000}))"
         )
         outcome = {}
-        worker = threading.Thread(target=lambda: outcome.update(result=run.launch_runs(
+        worker = threading.Thread(daemon=True, target=lambda: outcome.update(result=run.launch_runs(
             layout, [[str(self.root)]], 1, 0, [], self.root / "child.log",
             program=(sys.executable, "-c", script),
         )))
@@ -942,9 +948,16 @@ class TestReviewFixes(_ScratchDirTest):
             "status_reason": "ok", "created_at": "2026-01-01", "replicate": 0, "spec_hash": "pre-v6-hash",
             "params": old_params, "provenance": {"solver_identity": identity},
         })
+        run.write_run_record(layout.runs_dir, {
+            "id": "foreign", "coil_type": "other_adapter", "solver": "optimize", "equilibrium": "sphere",
+            "status": "pass", "status_reason": "ok", "created_at": "2026-01-02", "replicate": 0,
+            "spec_hash": "foreign-hash", "params": old_params, "provenance": {"solver_identity": identity},
+        })
         run.rebuild(layout, toy)
         self.assertEqual(run.find_duplicate(layout, toy, new_hash, 0)["id"], "old")
-        self.assertEqual(json.loads(layout.jsonl_path.read_text())["legacy_spec_hash"], "pre-v6-hash")
+        upgraded = {r["id"]: r for r in map(json.loads, layout.jsonl_path.read_text().splitlines())}
+        self.assertEqual(upgraded["old"]["legacy_spec_hash"], "pre-v6-hash")
+        self.assertEqual(upgraded["foreign"]["spec_hash"], "foreign-hash", "another adapter's run keeps its hash")
 
     # 7b — a spec running elsewhere is waited for, not dropped
     def test_in_progress_spec_is_retried_until_recorded(self):
@@ -968,6 +981,8 @@ class TestReviewFixes(_ScratchDirTest):
         run.IN_PROGRESS_RETRY_SECONDS = 0.5
         results, stop, failed = run.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log")
         self.assertEqual(([r["status"] for r in results], stop, failed), (["pass"], None, 0))
+        self.assertIn("running in another process", (self.root / "child.log").read_text(),
+                      "the first attempt must have found the spec claimed")
 
     # 9 — Path values are recorded as strings; replay restores flag types
     def test_path_values_are_json_safe(self):
@@ -975,19 +990,128 @@ class TestReviewFixes(_ScratchDirTest):
         self.assertEqual(spec["input"], "/data/in.h5")
         self.assertIsInstance(run.spec_hash(toy, spec, "v"), str)
 
-    def test_replay_arguments_are_parsed_back_to_their_types(self):
-        parser = run.build_parser(toy, "demo")
-        args = run.args_from_params(parser, {"mode": "optimize", "dim": 3, "step_size": 0.25, "seed": None}, 2)
-        self.assertEqual((args.dim, args.step_size, args.seed, args.replicate), (3, 0.25, None, 2))
-        self.assertIsInstance(args.dim, int)
-        with self.assertRaisesRegex(run.HarnessError, "cannot rebuild the run's arguments"):
+    def test_replay_uses_recorded_values_as_recorded(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--replicate", type=int, default=0)
+        parser.add_argument("--input", type=Path, default=Path("/default.h5"))
+        parser.add_argument("--sizes", type=int, nargs=2, default=[1, 1])
+        parser.add_argument("--verbose", action="store_true")
+        parser.add_argument("--seed", type=int, default=7)
+        parser.add_argument("--added-later", default="x")
+        recorded = json.loads(json.dumps(run.run_spec(parser.parse_args(
+            ["--input", "/data/in.h5", "--sizes", "3", "4", "--verbose"]
+        )) | {"seed": None}))
+        recorded.pop("added_later")
+        args = run.args_from_params(parser, recorded, 2)
+        self.assertEqual(
+            (args.input, args.sizes, args.verbose, args.seed, args.added_later, args.replicate),
+            ("/data/in.h5", [3, 4], True, None, "x", 2),
+            "lists, booleans and explicit None survive; paths come back as strings; new flags get defaults",
+        )
+        with self.assertRaisesRegex(run.HarnessError, "no longer has"):
             run.args_from_params(parser, {"removed_flag": 1}, 0)
+
+    def test_nested_paths_are_json_safe(self):
+        self.assertEqual(contract.clean({"a": [Path("/x"), (Path("/y"), 1.0)]}), {"a": ["/x", ["/y", 1.0]]})
 
     # 10 — the setup skill names every contract member
     def test_setup_skill_lists_every_contract_member(self):
         skill = (REPO_ROOT / ".claude" / "skills" / "setup-harness" / "SKILL.md").read_text()
         missing = [m for m in adapter.CONTRACT_MEMBERS if f"`{m}" not in skill]
         self.assertEqual(missing, [], "the skill's adapter checklist is missing contract members")
+
+
+class TestReviewRound2(_ScratchDirTest):
+    """Regressions from the re-review of the review fixes (2026-10-02)."""
+
+    def test_campaign_db_lock_excludes_other_threads(self):
+        layout = self._layout()
+        entered, release_first = threading.Event(), threading.Event()
+        order = []
+
+        def first():
+            with run.campaign_db_lock(layout):
+                order.append("first in")
+                entered.set()
+                release_first.wait(5)
+                order.append("first out")
+
+        def second():
+            entered.wait(5)
+            with run.campaign_db_lock(layout):
+                order.append("second in")
+
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        self.assertEqual(order, ["first in"], "the second thread must wait for the first")
+        release_first.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(order, ["first in", "first out", "second in"])
+
+    def test_campaign_db_lock_is_reentrant_across_path_spellings(self):
+        layout = self._layout()
+        link = self.root.parent / f"{self.root.name}-alias"
+        link.symlink_to(self.root, target_is_directory=True)
+        self.addCleanup(link.unlink)
+        alias = run.Layout(link, self.root / "scratch", self.root / "artifacts", "none")
+        done = threading.Event()
+
+        def nested():
+            with run.campaign_db_lock(layout), run.campaign_db_lock(alias):
+                done.set()
+
+        threading.Thread(target=nested, daemon=True).start()
+        self.assertTrue(done.wait(5), "nested lock through a different path spelling deadlocked")
+
+    @unittest.skipIf(os.name == "nt", "patches POSIX flock")
+    def test_lock_failures_other_than_contention_propagate(self):
+        original = locks.fcntl.flock
+
+        def unsupported(_fd, _op):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        self.addCleanup(setattr, locks.fcntl, "flock", original)
+        locks.fcntl.flock = unsupported
+        with self.assertRaises(OSError):
+            locks.try_lock(self.root / "x.lock")
+
+    def test_rebuild_creates_the_results_view(self):
+        layout = self._layout()
+        run.write_run_record(layout.runs_dir, {
+            "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
+            "created_at": "2026-01-01", "metrics": {"objective_J": 2.0},
+        })
+        run.rebuild(layout, toy)
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
+            self.assertEqual(db.execute("SELECT objective_J FROM results").fetchall(), [(2.0,)])
+
+    def test_promotion_base_check_does_not_fingerprint_the_solver(self):
+        campaigns = self.root / "campaigns"
+        demo = _make_campaign(campaigns, "demo", {"adapter": "toy"})
+        layout = run.resolve_layout(demo, {})
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({
+            "hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
+            "stages": [{"name": "screen", "base": {"problem": "sphere"}},
+                       {"name": "confirm", "from": "screen", "select": {"top": 1, "by": "objective_J"},
+                        "base": {"dim": 99, "timeout": 5}}],
+        }))
+        original = toy.solver_identity
+
+        def identity(args):
+            if args.timeout == 5:
+                raise AssertionError("fingerprinted the partial promotion spec")
+            return original(args)
+
+        self.addCleanup(setattr, toy, "solver_identity", original)
+        toy.solver_identity = identity
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = run.run_batch(toy, layout, run.build_parser(toy, "demo"), "demo", plan, 1, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertIn("confirm: top 1 of screen", out.getvalue())
 
 
 class TestReviewFixesEndToEnd(_CliTest):

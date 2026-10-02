@@ -41,6 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter
@@ -455,18 +456,21 @@ def write_run_record(runs_dir: Path, record: Mapping[str, object]) -> Path:
     return path
 
 
-# Held campaign DB locks in this process: lock path -> [fd, depth]. Re-entrant,
-# because a rebuild can start inside an insert that opened an outdated DB.
-_DB_LOCKS: dict[Path, list] = {}
+# Campaign DB locks held here: (canonical lock path, thread) -> [fd, depth].
+# Re-entrant per thread, because a rebuild can start inside an insert that
+# opened an outdated DB; each thread takes its own OS lock, so threads exclude
+# each other like processes do.
+_DB_LOCKS: dict[tuple[Path, int], list] = {}
 
 
 @contextlib.contextmanager
 def campaign_db_lock(layout: Layout):
-    """Serialize everything that writes results.db (inserts, rebuilds) across processes."""
-    path = layout.campaign_dir / ".db.lock"
-    held = _DB_LOCKS.get(path)
+    """Serialize every open, write and rebuild of results.db across processes and threads."""
+    path = (layout.campaign_dir / ".db.lock").resolve()
+    key = (path, threading.get_ident())
+    held = _DB_LOCKS.get(key)
     if held is None:
-        held = _DB_LOCKS[path] = [acquire(path), 0]
+        held = _DB_LOCKS[key] = [acquire(path), 0]
     held[1] += 1
     try:
         yield
@@ -474,7 +478,7 @@ def campaign_db_lock(layout: Layout):
         held[1] -= 1
         if held[1] == 0:
             release(held[0])
-            del _DB_LOCKS[path]
+            del _DB_LOCKS[key]
 
 
 def read_run_records(runs_dir: Path, active: ModuleType | None = None) -> list[dict]:
@@ -488,10 +492,11 @@ def upgrade_record(record: Mapping[str, object], active: ModuleType | None = Non
 
     Old records named the adapter, mode and target `coil_type`, `solver` and
     `equilibrium`, and kept some metrics as top-level fields. Their spec hash
-    was computed over the old param names, so with the campaign's adapter it
-    is recomputed from the upgraded params and the recorded solver identity
-    (the original is kept as `legacy_spec_hash`); that keeps old runs
-    deduplicating against identical new ones. Run files are never rewritten;
+    was computed over the old param names, so when the record belongs to the
+    given adapter it is recomputed from the upgraded params and the recorded
+    solver identity (the original is kept as `legacy_spec_hash`); that keeps
+    old runs deduplicating against identical new ones. Records of another
+    adapter keep their hash and can never match. Run files are never rewritten;
     they are converted whenever they are read.
     """
     if "coil_type" not in record:
@@ -508,7 +513,8 @@ def upgrade_record(record: Mapping[str, object], active: ModuleType | None = Non
     }
     upgraded = {**rest, **renamed, "metrics": metrics, "params": params}
     identity = (record.get("provenance") or {}).get("solver_identity")
-    if active is not None and record.get("spec_hash") and identity:
+    same_adapter = active is not None and upgraded.get("adapter") == active.NAME
+    if same_adapter and record.get("spec_hash") and identity:
         upgraded["legacy_spec_hash"] = record["spec_hash"]
         upgraded["spec_hash"] = spec_hash(active, params, identity)
     return upgraded
@@ -553,25 +559,24 @@ def _schema_version(db: sqlite3.Connection) -> int | None:
 def open_db(layout: Layout, active: ModuleType) -> sqlite3.Connection:
     """Open the campaign's DB, creating it if absent.
 
-    A DB from an older record-backed schema is rebuilt from runs/ under the
-    campaign DB lock (the version is rechecked once the lock is held, so
-    concurrent openers rebuild once); one from before run files existed is
-    refused with the command that imports it.
+    Connecting, creating and migrating all happen under the campaign DB lock,
+    so no process opens (or creates) the file while a rebuild replaces it,
+    and concurrent openers of an outdated DB rebuild it once. A DB from an
+    older record-backed schema is rebuilt from runs/; one from before run
+    files existed is refused with the command that imports it.
     """
-    db = sqlite3.connect(str(layout.db_path))
-    version = _schema_version(db)
-    if version is None:
-        _create_schema(db)
-        return db
-    if version != SCHEMA_VERSION:
+    with campaign_db_lock(layout):
+        db = sqlite3.connect(str(layout.db_path))
+        version = _schema_version(db)
+        if version is None:
+            _create_schema(db)
+            return db
+        if version == SCHEMA_VERSION:
+            return db
         db.close()
         if version >= FIRST_RECORD_BACKED_VERSION:
-            with campaign_db_lock(layout):
-                with contextlib.closing(sqlite3.connect(str(layout.db_path))) as current:
-                    still_old = _schema_version(current) != SCHEMA_VERSION
-                if still_old:
-                    print(f"results.db schema {version} -> {SCHEMA_VERSION}: rebuilding from runs/", file=sys.stderr)
-                    rebuild(layout, active)
+            print(f"results.db schema {version} -> {SCHEMA_VERSION}: rebuilding from runs/", file=sys.stderr)
+            rebuild(layout, active)
             return sqlite3.connect(str(layout.db_path))
         jsonl_hint = f" --from-jsonl {layout.jsonl_path}" if layout.jsonl_path.exists() else ""
         raise HarnessError(
@@ -579,7 +584,6 @@ def open_db(layout: Layout, active: ModuleType) -> sqlite3.Connection:
             f"{SCHEMA_VERSION}. Regenerate it: python run.py rebuild "
             f"--campaign {layout.campaign_dir.name}{jsonl_hint}"
         )
-    return db
 
 
 def find_duplicate(layout: Layout, active: ModuleType, digest: str, replicate: int) -> dict | None:
@@ -652,6 +656,7 @@ def rebuild(layout: Layout, active: ModuleType) -> int:
             _create_schema(db)
             db.executemany(_INSERT_SQL, [_db_row(r) for r in records])
             db.commit()
+            _create_results_view(db, active)
         if layout.db_path.exists():
             with contextlib.closing(sqlite3.connect(str(layout.db_path))) as old:
                 old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -901,21 +906,18 @@ def compare_runs(original: Mapping[str, object], replay: Mapping[str, object], t
 def args_from_params(
     parser: argparse.ArgumentParser, params: Mapping[str, object], replicate: int
 ) -> argparse.Namespace:
-    """Recorded params parsed back through the adapter's parser, restoring each flag's type.
+    """The recorded run's arguments: parser defaults overlaid with the recorded params.
 
-    None means the flag's default; booleans are set directly (they have no
-    `--flag value` form).
+    Values are used exactly as recorded (lists, booleans, explicit None),
+    which are the parsed values in JSON form — paths as strings (see
+    contract.py). Defaults fill only flags added to the adapter since; a
+    recorded flag the adapter no longer has is refused.
     """
-    argv, booleans = ["--replicate", str(replicate)], {}
-    for dest, value in sorted(params.items()):
-        if isinstance(value, bool):
-            booleans[dest] = value
-        elif value is not None:
-            argv += [_flag(dest), str(value)]
-    parsed = _parse_planned(parser, argv)
-    if isinstance(parsed, str):
-        raise HarnessError(f"cannot rebuild the run's arguments with the current adapter: {parsed}")
-    return argparse.Namespace(**{**vars(parsed), **booleans})
+    defaults = vars(parser.parse_args([]))
+    removed = sorted(set(params) - set(defaults))
+    if removed:
+        raise HarnessError(f"cannot rebuild the run's arguments: the adapter no longer has {removed}")
+    return argparse.Namespace(**{**defaults, **params, "replicate": replicate})
 
 
 def replay(
@@ -1042,33 +1044,47 @@ def _cell(value: object) -> str:
     return text if len(text) <= QUERY_CELL_CHARS else text[: QUERY_CELL_CHARS - 1] + "…"
 
 
-def ensure_results_view(layout: Layout, active: ModuleType) -> None:
-    """(Re)create the `results` view — runs plus one column per METRICS key — and goal indexes.
-
-    Rebuilt each time it is needed, so it always matches the adapter's
-    current METRICS. Goal metrics get expression indexes for fast ORDER BY.
-    """
+def _results_view_sql(active: ModuleType, temporary: bool) -> str:
+    """DDL for the `results` view (runs plus one column per METRICS key)."""
     clashes = sorted(set(active.METRICS) & set(DB_COLUMNS))
     if clashes:
         raise HarnessError(f"adapter '{active.NAME}' METRICS reuse run column names: {clashes}")
     columns = ", ".join(
         [*IDENTITY_COLUMNS, *(f"json_extract(metrics, '$.{m}') AS {m}" for m in active.METRICS)]
     )
+    kind = "TEMP VIEW" if temporary else "VIEW"
+    return f"CREATE {kind} {RESULTS_VIEW} AS SELECT {columns} FROM runs;"
+
+
+def _create_results_view(db: sqlite3.Connection, active: ModuleType) -> None:
+    """(Re)create the persistent `results` view and the goal-metric expression indexes."""
     indexes = "".join(
         f"CREATE INDEX IF NOT EXISTS idx_metric_{m} ON runs(json_extract(metrics, '$.{m}'));\n"
         for m, goal in active.METRICS.items() if goal
     )
+    db.executescript(
+        f"BEGIN IMMEDIATE;\nDROP VIEW IF EXISTS {RESULTS_VIEW};\n"
+        f"{_results_view_sql(active, temporary=False)}\n{indexes}COMMIT;"
+    )
+
+
+def ensure_results_view(layout: Layout, active: ModuleType) -> None:
+    """Refresh the persistent `results` view (for sqlite3 and other tools) and its indexes.
+
+    Rebuilt each time it is needed, so it always matches the adapter's
+    current METRICS; `rebuild` also creates it in the new DB.
+    """
     with campaign_db_lock(layout), contextlib.closing(open_db(layout, active)) as db:
-        db.executescript(
-            f"BEGIN IMMEDIATE;\nDROP VIEW IF EXISTS {RESULTS_VIEW};\n"
-            f"CREATE VIEW {RESULTS_VIEW} AS SELECT {columns} FROM runs;\n{indexes}COMMIT;"
-        )
+        _create_results_view(db, active)
 
 
 def query(layout: Layout, active: ModuleType, sql: str, limit: int) -> str:
     """Run one read-only SQL statement; return tab-separated rows (header first), capped.
 
-    The `results` view (runs plus one column per metric) is refreshed first.
+    The `results` view (runs plus one column per metric) is created as a
+    temporary view on the query's own read-only connection, so a concurrent
+    rebuild cannot remove it between refresh and use; the persistent view and
+    indexes are refreshed too, for other tools.
     """
     if not layout.db_path.exists():
         raise HarnessError(f"no {layout.db_path} yet: run an experiment first")
@@ -1076,6 +1092,7 @@ def query(layout: Layout, active: ModuleType, sql: str, limit: int) -> str:
     uri = f"{layout.db_path.resolve().as_uri()}?mode=ro"
     try:
         with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+            db.execute(_results_view_sql(active, temporary=True))
             cursor = db.execute(sql)
             columns = [d[0] for d in cursor.description or ()]
             rows = cursor.fetchmany(limit + 1)
@@ -1340,11 +1357,13 @@ def run_batch(
             if unknown:
                 errors.append(f"{stage.name}: unknown params {unknown}")
             else:
-                # Carried values come from earlier runs; the stage's own values can be checked now.
-                _, _, base_errors = check_planned(
-                    active, layout, parser, [batch.PlannedRun(stage.name, stage.base, 0)], campaign, "check", identity
+                # Carried values come from earlier runs; the stage's own values can be checked now,
+                # by parsing only (no solver fingerprint: carried flags may move the solver).
+                parsed = _parse_planned(
+                    parser, planned_argv(batch.PlannedRun(stage.name, stage.base, 0), campaign, "check")
                 )
-                errors += base_errors
+                if isinstance(parsed, str):
+                    errors.append(f"{stage.name} base {dict(stage.base)}: {parsed}")
             previews.append(
                 f"{stage.name}: top {stage.top} of {stage.source} by {stage.rank_by} × {stage.replicates} replicates"
             )

@@ -63,6 +63,10 @@ Adapters read environment variables when a run starts, never at import:
 every registered adapter is imported on every run, including campaigns that
 use a different one.
 
+The core records every parsed flag of a run as JSON. On `run.py replay` an
+adapter receives those recorded values (paths as strings, tuples as lists),
+so convert where the type matters (e.g. `Path(args.input)`).
+
 Metric keys are snake_case names declared in METRICS. The core stores every
 emitted metric in the run's `metrics` JSON; the `results` view gives each
 declared key its own column for SQL.
@@ -146,11 +150,15 @@ class ExperimentOutcome:
 
 
 def clean(v: object) -> object:
-    """A JSON-safe value: NaN/Inf floats become None, paths become strings; else unchanged."""
+    """A JSON-safe value: NaN/Inf floats become None, paths become strings, at any depth."""
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
     if isinstance(v, os.PathLike):
         return os.fspath(v)
+    if isinstance(v, (list, tuple)):
+        return [clean(x) for x in v]
+    if isinstance(v, dict):
+        return {k: clean(x) for k, x in v.items()}
     return v
 
 

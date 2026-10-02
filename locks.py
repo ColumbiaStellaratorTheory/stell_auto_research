@@ -8,6 +8,7 @@ locks the file's first byte with msvcrt.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -20,6 +21,9 @@ else:
     import fcntl
 
 SLOT_POLL_SECONDS = 1.0
+# Errors that mean "someone else holds the lock". Anything else (no lock
+# support, too many locks) is a real failure and propagates.
+_CONTENTION = {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK}
 
 
 def try_lock(path: Path) -> int | None:
@@ -32,9 +36,11 @@ def try_lock(path: Path) -> int | None:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         os.close(fd)
-        return None
+        if e.errno in _CONTENTION:
+            return None
+        raise
     return fd
 
 
