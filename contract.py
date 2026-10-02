@@ -146,9 +146,11 @@ class ExperimentOutcome:
 
 
 def clean(v: object) -> object:
-    """Map NaN/Inf floats to None for JSON and SQLite safety; pass else through."""
+    """A JSON-safe value: NaN/Inf floats become None, paths become strings; else unchanged."""
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
+    if isinstance(v, os.PathLike):
+        return os.fspath(v)
     return v
 
 

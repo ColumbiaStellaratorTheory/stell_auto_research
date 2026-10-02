@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import adapter
 import analysis
+import batch
 import contract
 import locks
 import machine
@@ -314,7 +316,7 @@ class TestRebuild(_ScratchDirTest):
         layout = self._layout()
         for rid, created in (("r2", "2026-01-02"), ("r1", "2026-01-01")):
             run.write_run_record(layout.runs_dir, self._record(rid, created))
-        self.assertEqual(run.rebuild(layout), 2)
+        self.assertEqual(run.rebuild(layout, toy), 2)
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             rows = db.execute("SELECT id, json_extract(metrics, '$.objective_J') FROM runs ORDER BY id").fetchall()
         self.assertEqual(rows, [("r1", 1.5), ("r2", 1.5)])
@@ -325,15 +327,15 @@ class TestRebuild(_ScratchDirTest):
         layout = self._layout()
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
-        run.rebuild(layout)
+        run.rebuild(layout, toy)
         self.assertEqual(len(list(self.root.glob("results.db.bak-*"))), 1)
 
     def test_legacy_jsonl_import_is_idempotent(self):
         layout = self._layout()
         legacy = self.root / "old.jsonl"
         legacy.write_text(json.dumps({**self._record("old1", "2025-01-01"), "spec_hash": None}) + "\n")
-        self.assertEqual(run.import_jsonl(layout, legacy), 1)
-        self.assertEqual(run.import_jsonl(layout, legacy), 0)
+        self.assertEqual(run.import_jsonl(layout, toy, legacy), 1)
+        self.assertEqual(run.import_jsonl(layout, toy, legacy), 0)
         record = json.loads((layout.runs_dir / "old1.json").read_text())
         self.assertEqual(record["provenance"], {"imported_from": str(legacy)})
 
@@ -342,7 +344,7 @@ class TestRebuild(_ScratchDirTest):
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
         with self.assertRaisesRegex(run.HarnessError, "schema version 0.*python run.py rebuild"):
-            run.open_db(layout)
+            run.open_db(layout, toy)
 
 
 class TestCompareRuns(unittest.TestCase):
@@ -545,7 +547,7 @@ class TestSchemaUpgrade(_ScratchDirTest):
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
             db.execute("CREATE TABLE runs (id TEXT)")
             db.execute("PRAGMA user_version = 2")
-        with contextlib.closing(run.open_db(layout)) as db:
+        with contextlib.closing(run.open_db(layout, toy)) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
             self.assertEqual(
                 db.execute("SELECT id, adapter, mode, target FROM runs").fetchall(),
@@ -585,7 +587,7 @@ class TestQueryAndLessons(_ScratchDirTest):
                 "status": "pass", "status_reason": "ok", "created_at": f"2026-01-{i + 1:02d}",
                 "metrics": {"objective_J": float(i)},
             })
-        run.rebuild(layout)
+        run.rebuild(layout, toy)
         return layout
 
     def test_query_returns_header_and_rows(self):
@@ -832,7 +834,7 @@ class TestGenericSchema(_ScratchDirTest):
             "id": "r1", "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
             "created_at": "2026-01-01", "metrics": {"objective_J": 0.25, "optimizer_success": True},
         })
-        run.rebuild(layout)
+        run.rebuild(layout, toy)
         out = run.query(layout, toy, "SELECT objective_J, optimizer_success, final_step FROM results", 5)
         self.assertEqual(out.splitlines(), ["objective_J\toptimizer_success\tfinal_step", "0.25\t1\t"])
         with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
@@ -850,6 +852,184 @@ class TestGenericSchema(_ScratchDirTest):
         clash = types.SimpleNamespace(NAME="clash", METRICS={"status": None})
         with self.assertRaisesRegex(run.HarnessError, "reuse run column names"):
             run.ensure_results_view(layout, clash)
+
+
+
+class TestReviewFixes(_ScratchDirTest):
+    """Regression tests for the cross-lab review of general-harness (2026-10-02)."""
+
+    def _toy_record(self, rid: str, created: str, **extra) -> dict:
+        return {"id": rid, "adapter": "toy", "mode": "optimize", "target": "sphere", "status": "pass",
+                "status_reason": "ok", "created_at": created, **extra}
+
+    # 1 — concurrent migration is serialized and loses nothing
+    def test_parallel_openers_migrate_an_old_db_once_without_losing_rows(self):
+        layout = self._layout()
+        for i in range(20):
+            run.write_run_record(layout.runs_dir, self._toy_record(f"r{i:02d}", f"2026-01-{i + 1:02d}"))
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
+            db.execute("CREATE TABLE runs (id TEXT)")
+            db.execute("PRAGMA user_version = 2")
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import contextlib, run; from adapters import toy; "
+            "from pathlib import Path; d = Path(sys.argv[2]); "
+            "layout = run.Layout(d, d / 'scratch', d / 'artifacts', 'none'); "
+            "contextlib.closing(run.open_db(layout, toy)).__enter__().close()"
+        )
+        procs = [subprocess.Popen([sys.executable, "-c", script, str(REPO_ROOT), str(self.root)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
+        for proc in procs:
+            _, err = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 0, err.decode())
+        with contextlib.closing(sqlite3.connect(layout.db_path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], run.SCHEMA_VERSION)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 20)
+        self.assertEqual(list(self.root.glob("results.db.rebuild*")), [], "no temp DB left behind")
+        self.assertEqual(len(list(self.root.glob("results.db.bak-*"))), 1, "migrated exactly once")
+
+    # 3 — Ctrl-C during a run is recorded
+    def test_keyboard_interrupt_is_recorded_as_cancelled(self):
+        def interrupted(_args, _run):
+            raise KeyboardInterrupt
+        adapter_ = types.SimpleNamespace(NAME="x", TARGET_FLAG="problem", SEED_FLAG=None, EXECUTION_FLAGS=(),
+                                         run_experiment=interrupted)
+        args = argparse.Namespace(campaign="c", replicate=0, mode="optimize", problem="sphere")
+        record = run.execute(adapter_, self._layout(), args, "v0")
+        self.assertEqual((record["status"], record["status_reason"]), ("crash", "cancelled"))
+        self.assertTrue((self.root / "runs" / f"{record['id']}.json").exists())
+
+    # 4 — a child printing a large result cannot block the batch
+    def test_large_child_output_does_not_block(self):
+        layout = self._layout()
+        script = (
+            "import json, sys; from pathlib import Path; d = Path(sys.argv[1]) / 'runs'; d.mkdir(exist_ok=True); "
+            "(d / 'big.json').write_text(json.dumps({'id': 'big', 'status': 'pass', 'metrics': {}})); "
+            "print(json.dumps({'id': 'big', 'padding': 'x' * 2_000_000}))"
+        )
+        outcome = {}
+        worker = threading.Thread(target=lambda: outcome.update(result=run.launch_runs(
+            layout, [[str(self.root)]], 1, 0, [], self.root / "child.log",
+            program=(sys.executable, "-c", script),
+        )))
+        worker.start()
+        worker.join(timeout=60)
+        self.assertFalse(worker.is_alive(), "launch_runs blocked on a large child output")
+        results, stop, failed = outcome["result"]
+        self.assertEqual(([r["id"] for r in results], stop, failed), (["big"], None, 0))
+
+    # 5 — importing an export keeps its provenance and evidence
+    def test_import_keeps_provenance_and_evidence(self):
+        layout = self._layout()
+        export = self.root / "export.jsonl"
+        exported = self._toy_record("e1", "2026-01-01", provenance={"solver_identity": "abc", "adapter": {"command": ["x"]}},
+                                    evidence={"log": {"sha256": "f00", "bytes": 3}})
+        export.write_text(json.dumps(exported) + "\n")
+        run.import_jsonl(layout, toy, export)
+        record = json.loads((layout.runs_dir / "e1.json").read_text())
+        self.assertEqual(record["provenance"]["solver_identity"], "abc")
+        self.assertEqual(record["provenance"]["imported_from"], str(export))
+        self.assertEqual(record["evidence"], {"log": {"sha256": "f00", "bytes": 3}})
+
+    # 6 — an upgraded old run deduplicates against the identical new run
+    def test_upgraded_old_run_matches_the_new_spec_hash(self):
+        layout = self._layout()
+        args = run.with_seed(toy, _toy_args(problem="sphere", seed=5))
+        identity = toy.solver_identity(args)
+        new_hash = run.spec_hash(toy, run.run_spec(args), identity)
+        old_params = {("solver" if k == "mode" else k): v for k, v in run.run_spec(args).items()}
+        run.write_run_record(layout.runs_dir, {
+            "id": "old", "coil_type": "toy", "solver": "optimize", "equilibrium": "sphere", "status": "pass",
+            "status_reason": "ok", "created_at": "2026-01-01", "replicate": 0, "spec_hash": "pre-v6-hash",
+            "params": old_params, "provenance": {"solver_identity": identity},
+        })
+        run.rebuild(layout, toy)
+        self.assertEqual(run.find_duplicate(layout, toy, new_hash, 0)["id"], "old")
+        self.assertEqual(json.loads(layout.jsonl_path.read_text())["legacy_spec_hash"], "pre-v6-hash")
+
+    # 7b — a spec running elsewhere is waited for, not dropped
+    def test_in_progress_spec_is_retried_until_recorded(self):
+        campaigns = self.root / "campaigns"
+        demo = _make_campaign(campaigns, "demo", {"adapter": "toy"})
+        layout = run.resolve_layout(demo, {})
+        parser = run.build_parser(toy, "demo")
+        planned = [batch.PlannedRun("s", {"problem": "sphere", "maxiter": 50}, 0)]
+        argvs, _, errors = run.check_planned(toy, layout, parser, planned, "demo", "b1", run._IdentityCache(toy))
+        self.assertEqual(errors, [])
+        args = run.with_seed(toy, parser.parse_args(argvs[0]))
+        digest = run.spec_hash(toy, run.run_spec(args), toy.solver_identity(args))
+        claim = locks.try_lock(layout.claims_dir / f"{digest}-0.lock")
+        threading.Timer(1.5, locks.release, args=(claim,)).start()
+        environ = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine"),
+                   run.MAX_PARALLEL_ENV: "2", run.SLOTS_DIR_ENV: str(self.root / "slots")}
+        original_env, original_delay = dict(os.environ), run.IN_PROGRESS_RETRY_SECONDS
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original_env)))
+        self.addCleanup(setattr, run, "IN_PROGRESS_RETRY_SECONDS", original_delay)
+        os.environ.update(environ)
+        run.IN_PROGRESS_RETRY_SECONDS = 0.5
+        results, stop, failed = run.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log")
+        self.assertEqual(([r["status"] for r in results], stop, failed), (["pass"], None, 0))
+
+    # 9 — Path values are recorded as strings; replay restores flag types
+    def test_path_values_are_json_safe(self):
+        spec = run.run_spec(argparse.Namespace(campaign="c", replicate=0, mode="m", input=Path("/data/in.h5")))
+        self.assertEqual(spec["input"], "/data/in.h5")
+        self.assertIsInstance(run.spec_hash(toy, spec, "v"), str)
+
+    def test_replay_arguments_are_parsed_back_to_their_types(self):
+        parser = run.build_parser(toy, "demo")
+        args = run.args_from_params(parser, {"mode": "optimize", "dim": 3, "step_size": 0.25, "seed": None}, 2)
+        self.assertEqual((args.dim, args.step_size, args.seed, args.replicate), (3, 0.25, None, 2))
+        self.assertIsInstance(args.dim, int)
+        with self.assertRaisesRegex(run.HarnessError, "cannot rebuild the run's arguments"):
+            run.args_from_params(parser, {"removed_flag": 1}, 0)
+
+    # 10 — the setup skill names every contract member
+    def test_setup_skill_lists_every_contract_member(self):
+        skill = (REPO_ROOT / ".claude" / "skills" / "setup-harness" / "SKILL.md").read_text()
+        missing = [m for m in adapter.CONTRACT_MEMBERS if f"`{m}" not in skill]
+        self.assertEqual(missing, [], "the skill's adapter checklist is missing contract members")
+
+
+class TestReviewFixesEndToEnd(_CliTest):
+    """CLI-level regressions from the review."""
+
+    # 2 — replay waits for a machine slot
+    @unittest.skipIf(os.name == "nt", "uses POSIX locks from the test process")
+    def test_replay_waits_for_a_free_slot(self):
+        original = self._json("--problem", "sphere", "--maxiter", "50")
+        env = {**os.environ, run.CAMPAIGNS_DIR_ENV: str(self.campaigns), run.MACHINE_DIR_ENV: str(self.root / "machine"),
+               run.SLOTS_DIR_ENV: str(self.root / "slots"), run.MAX_PARALLEL_ENV: "1"}
+        env.pop(run.CAMPAIGN_ENV, None)
+        held = locks.acquire_slot(self.root / "slots", 1)
+        proc = subprocess.Popen([sys.executable, str(REPO_ROOT / "run.py"), "replay", original["id"]],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=REPO_ROOT)
+        time.sleep(2)
+        self.assertIsNone(proc.poll(), "replay ran without a free slot")
+        self.assertEqual(len(self._run_files()), 1)
+        locks.release(held)
+        out, err = proc.communicate(timeout=60)
+        self.assertTrue(json.loads(out)["match"], err)
+
+    # 7a — identical specs in one batch run once
+    def test_identical_specs_in_a_batch_run_once(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
+                                    "stages": [{"base": {"problem": "sphere", "maxiter": 50},
+                                                "runs": [{"dim": 2}, {"dim": 2}]}]}))
+        proc = self._run("batch", str(plan))
+        self.assertIn("stage0: 1 runs (0 already recorded)", proc.stdout, proc.stderr)
+        self.assertEqual(len(self._run_files()), 1)
+
+    # 8 — promotion base values are checked before anything runs
+    def test_invalid_promotion_base_fails_the_dry_run(self):
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
+                                    "stages": [{"name": "screen", "base": {"problem": "sphere"}},
+                                               {"name": "confirm", "from": "screen", "select": {"top": 1, "by": "objective_J"},
+                                                "base": {"dim": "bad"}}]}))
+        proc = self._run("batch", str(plan), "--dry-run")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("invalid int value: 'bad'", proc.stderr)
 
 
 if __name__ == "__main__":

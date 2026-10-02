@@ -167,6 +167,8 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      the flag naming the target configuration, e.g. `"case"`),
      `REQUIRED_ENV` / `OPTIONAL_ENV`, `EXECUTION_FLAGS` (dests that change how
      a run executes but not its result: timeout, threads, solver location),
+     `THREADS_FLAG` (the dest of the solver's threads-per-run flag, or `None`
+     for a single-threaded solver; drives how many runs fit on the machine),
      `SEED_FLAG` (the solver's RNG seed flag dest with default `None`, or
      `None` if the solver is deterministic), `REPLAY_TOLERANCE` (relative
      per-metric tolerance for `run.py replay`; say in a comment whether it was

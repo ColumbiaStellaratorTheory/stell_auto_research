@@ -40,6 +40,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -53,7 +54,7 @@ import batch
 import machine
 from adapter import AdapterError, load_adapter
 from contract import Cancelled, ExperimentOutcome, RunContext, clean, git_output, sha256_file
-from locks import acquire_slot, release, report_waiting, try_lock
+from locks import acquire, acquire_slot, release, report_waiting, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
@@ -72,6 +73,9 @@ BLOBS_DIR_ENV = "AUTORESEARCH_BLOBS_DIR"
 MACHINE_DIR_ENV = "AUTORESEARCH_MACHINE_DIR"
 CANCELLED_EXIT = 143
 BATCH_POLL_SECONDS = 0.2
+# A spec another process is running right now is retried after this delay;
+# once that run is recorded the retry is reused (or, after a crash, re-run).
+IN_PROGRESS_RETRY_SECONDS = 5.0
 BATCH_SUMMARY_ROWS = 10
 LESSONS_NAME = "LESSONS.md"
 QUERY_DEFAULT_LIMIT = 50
@@ -451,18 +455,44 @@ def write_run_record(runs_dir: Path, record: Mapping[str, object]) -> Path:
     return path
 
 
-def read_run_records(runs_dir: Path) -> list[dict]:
-    """Every run record, ordered by (created_at, id)."""
-    records = [upgrade_record(json.loads(p.read_text())) for p in runs_dir.glob("*.json")]
+# Held campaign DB locks in this process: lock path -> [fd, depth]. Re-entrant,
+# because a rebuild can start inside an insert that opened an outdated DB.
+_DB_LOCKS: dict[Path, list] = {}
+
+
+@contextlib.contextmanager
+def campaign_db_lock(layout: Layout):
+    """Serialize everything that writes results.db (inserts, rebuilds) across processes."""
+    path = layout.campaign_dir / ".db.lock"
+    held = _DB_LOCKS.get(path)
+    if held is None:
+        held = _DB_LOCKS[path] = [acquire(path), 0]
+    held[1] += 1
+    try:
+        yield
+    finally:
+        held[1] -= 1
+        if held[1] == 0:
+            release(held[0])
+            del _DB_LOCKS[path]
+
+
+def read_run_records(runs_dir: Path, active: ModuleType | None = None) -> list[dict]:
+    """Every run record, upgraded to the current shape, ordered by (created_at, id)."""
+    records = [upgrade_record(json.loads(p.read_text()), active) for p in runs_dir.glob("*.json")]
     return sorted(records, key=lambda r: (r.get("created_at") or "", r["id"]))
 
 
-def upgrade_record(record: Mapping[str, object]) -> dict:
+def upgrade_record(record: Mapping[str, object], active: ModuleType | None = None) -> dict:
     """A run record in the current shape; records from before schema v6 are converted.
 
     Old records named the adapter, mode and target `coil_type`, `solver` and
-    `equilibrium`, and kept some metrics as top-level fields. Run files are
-    never rewritten; they are converted whenever they are read.
+    `equilibrium`, and kept some metrics as top-level fields. Their spec hash
+    was computed over the old param names, so with the campaign's adapter it
+    is recomputed from the upgraded params and the recorded solver identity
+    (the original is kept as `legacy_spec_hash`); that keeps old runs
+    deduplicating against identical new ones. Run files are never rewritten;
+    they are converted whenever they are read.
     """
     if "coil_type" not in record:
         return dict(record)
@@ -476,7 +506,12 @@ def upgrade_record(record: Mapping[str, object]) -> dict:
         k: v for k, v in record.items()
         if k not in LEGACY_RENAMES and k not in LEGACY_METRIC_FIELDS and k not in ("metrics", "params")
     }
-    return {**rest, **renamed, "metrics": metrics, "params": params}
+    upgraded = {**rest, **renamed, "metrics": metrics, "params": params}
+    identity = (record.get("provenance") or {}).get("solver_identity")
+    if active is not None and record.get("spec_hash") and identity:
+        upgraded["legacy_spec_hash"] = record["spec_hash"]
+        upgraded["spec_hash"] = spec_hash(active, params, identity)
+    return upgraded
 
 
 def _db_row(record: Mapping[str, object]) -> dict:
@@ -515,11 +550,13 @@ def _schema_version(db: sqlite3.Connection) -> int | None:
     return db.execute("PRAGMA user_version").fetchone()[0] if has_runs else None
 
 
-def open_db(layout: Layout) -> sqlite3.Connection:
+def open_db(layout: Layout, active: ModuleType) -> sqlite3.Connection:
     """Open the campaign's DB, creating it if absent.
 
-    A DB from an older record-backed schema is rebuilt from runs/; one from
-    before run files existed is refused with the command that imports it.
+    A DB from an older record-backed schema is rebuilt from runs/ under the
+    campaign DB lock (the version is rechecked once the lock is held, so
+    concurrent openers rebuild once); one from before run files existed is
+    refused with the command that imports it.
     """
     db = sqlite3.connect(str(layout.db_path))
     version = _schema_version(db)
@@ -529,8 +566,12 @@ def open_db(layout: Layout) -> sqlite3.Connection:
     if version != SCHEMA_VERSION:
         db.close()
         if version >= FIRST_RECORD_BACKED_VERSION:
-            print(f"results.db schema {version} -> {SCHEMA_VERSION}: rebuilding from runs/", file=sys.stderr)
-            rebuild(layout)
+            with campaign_db_lock(layout):
+                with contextlib.closing(sqlite3.connect(str(layout.db_path))) as current:
+                    still_old = _schema_version(current) != SCHEMA_VERSION
+                if still_old:
+                    print(f"results.db schema {version} -> {SCHEMA_VERSION}: rebuilding from runs/", file=sys.stderr)
+                    rebuild(layout, active)
             return sqlite3.connect(str(layout.db_path))
         jsonl_hint = f" --from-jsonl {layout.jsonl_path}" if layout.jsonl_path.exists() else ""
         raise HarnessError(
@@ -541,11 +582,11 @@ def open_db(layout: Layout) -> sqlite3.Connection:
     return db
 
 
-def find_duplicate(layout: Layout, digest: str, replicate: int) -> dict | None:
+def find_duplicate(layout: Layout, active: ModuleType, digest: str, replicate: int) -> dict | None:
     """The latest pass/fail run with this spec hash and replicate, if any."""
     if not layout.db_path.exists():
         return None
-    with contextlib.closing(open_db(layout)) as db:
+    with contextlib.closing(open_db(layout, active)) as db:
         db.row_factory = sqlite3.Row
         row = db.execute(
             f"SELECT id, status, status_reason FROM runs WHERE spec_hash = ? AND replicate = ? "
@@ -556,22 +597,33 @@ def find_duplicate(layout: Layout, digest: str, replicate: int) -> dict | None:
     return dict(row) if row else None
 
 
-def index_record(layout: Layout, record: Mapping[str, object]) -> None:
-    """Add one run record to results.db. A failure leaves the run file intact."""
+def index_record(layout: Layout, active: ModuleType, record: Mapping[str, object]) -> None:
+    """Add one run record to results.db. A failure leaves the run file intact.
+
+    Held under the campaign DB lock, so a concurrent rebuild cannot swap the
+    DB file between this insert's open and commit.
+    """
     try:
-        with contextlib.closing(open_db(layout)) as db:
+        with campaign_db_lock(layout), contextlib.closing(open_db(layout, active)) as db:
             db.execute(_INSERT_SQL, _db_row(record))
             db.commit()
     except (sqlite3.Error, HarnessError) as e:
         print(f"WARNING: results.db not updated ({e}); run `python run.py rebuild`", file=sys.stderr)
 
 
-def _legacy_record(raw: dict, source: Path) -> dict:
-    """A results.jsonl record from an older harness, in the current record shape."""
-    return {**upgrade_record(raw), "provenance": {"imported_from": str(source)}, "evidence": {}}
+def _legacy_record(raw: dict, source: Path, active: ModuleType) -> dict:
+    """A results.jsonl record in the current record shape, annotated with its source.
+
+    Provenance and evidence the export carried are kept; the import only adds
+    `imported_from`.
+    """
+    record = upgrade_record(raw, active)
+    record["provenance"] = {**(record.get("provenance") or {}), "imported_from": str(source)}
+    record["evidence"] = record.get("evidence") or {}
+    return record
 
 
-def import_jsonl(layout: Layout, source: Path) -> int:
+def import_jsonl(layout: Layout, active: ModuleType, source: Path) -> int:
     """Write a run file for each record in `source` that has none yet; return the count."""
     imported = 0
     for line in source.read_text().splitlines():
@@ -580,34 +632,37 @@ def import_jsonl(layout: Layout, source: Path) -> int:
         raw = json.loads(line)
         if (layout.runs_dir / f"{raw['id']}.json").exists():
             continue
-        write_run_record(layout.runs_dir, _legacy_record(raw, source))
+        write_run_record(layout.runs_dir, _legacy_record(raw, source, active))
         imported += 1
     return imported
 
 
-def rebuild(layout: Layout) -> int:
+def rebuild(layout: Layout, active: ModuleType) -> int:
     """Regenerate results.db and results.jsonl from runs/*.json; return the row count.
 
-    The previous DB, if any, is kept as results.db.bak-<timestamp>.
+    Runs under the campaign DB lock, so no insert lands in a DB that is about
+    to be replaced and two rebuilds never interleave. The previous DB, if
+    any, is kept as results.db.bak-<timestamp>.
     """
-    records = read_run_records(layout.runs_dir)
-    tmp_db = layout.db_path.with_name("results.db.rebuild")
-    tmp_db.unlink(missing_ok=True)
-    with contextlib.closing(sqlite3.connect(str(tmp_db))) as db:
-        _create_schema(db)
-        db.executemany(_INSERT_SQL, [_db_row(r) for r in records])
-        db.commit()
-    if layout.db_path.exists():
-        with contextlib.closing(sqlite3.connect(str(layout.db_path))) as old:
-            old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        layout.db_path.rename(layout.db_path.with_name(f"results.db.bak-{stamp}"))
-    for sidecar in ("results.db-wal", "results.db-shm"):
-        layout.db_path.with_name(sidecar).unlink(missing_ok=True)
-    os.replace(tmp_db, layout.db_path)
-    lines = "".join(json.dumps(r) + "\n" for r in records)
-    _write_atomic(layout.jsonl_path, lines.encode())
-    return len(records)
+    with campaign_db_lock(layout):
+        records = read_run_records(layout.runs_dir, active)
+        tmp_db = layout.db_path.with_name(f"results.db.rebuild-{os.getpid()}")
+        tmp_db.unlink(missing_ok=True)
+        with contextlib.closing(sqlite3.connect(str(tmp_db))) as db:
+            _create_schema(db)
+            db.executemany(_INSERT_SQL, [_db_row(r) for r in records])
+            db.commit()
+        if layout.db_path.exists():
+            with contextlib.closing(sqlite3.connect(str(layout.db_path))) as old:
+                old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            layout.db_path.rename(layout.db_path.with_name(f"results.db.bak-{stamp}"))
+        for sidecar in ("results.db-wal", "results.db-shm"):
+            layout.db_path.with_name(sidecar).unlink(missing_ok=True)
+        os.replace(tmp_db, layout.db_path)
+        lines = "".join(json.dumps(r) + "\n" for r in records)
+        _write_atomic(layout.jsonl_path, lines.encode())
+        return len(records)
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +755,7 @@ def _read_views(db: sqlite3.Connection, active: ModuleType) -> list[dict]:
 def load_views(layout: Layout, active: ModuleType) -> list[dict]:
     if not layout.db_path.exists():
         return []
-    with contextlib.closing(open_db(layout)) as db:
+    with contextlib.closing(open_db(layout, active)) as db:
         return _read_views(db, active)
 
 
@@ -742,7 +797,8 @@ def execute(
     t0 = time.monotonic()
     try:
         outcome = active.run_experiment(args, RunContext(run_id=run_id, dir=run_dir))
-    except Cancelled:
+    except (Cancelled, KeyboardInterrupt):
+        # SIGTERM or Ctrl-C: run_solver already killed the solver's process tree.
         print("Run cancelled; recording it.", file=sys.stderr)
         outcome = ExperimentOutcome("crash", "cancelled")
     except Exception as e:
@@ -764,7 +820,7 @@ def execute(
     )
     record["peak_rss_mb"] = round(peak_rss_mb, 1) if peak_rss_mb is not None else None
     write_run_record(layout.runs_dir, record)
-    index_record(layout, record)
+    index_record(layout, active, record)
     _finalize_run_dir(layout, run_dir, outcome.status, run_id)
     return record
 
@@ -782,7 +838,7 @@ def run_once(active: ModuleType, layout: Layout, slots: Slots, args: argparse.Na
         print("This spec is running in another process right now.", file=sys.stderr)
         return {"in_progress": True, "spec_hash": digest, "replicate": args.replicate}
     try:
-        duplicate = find_duplicate(layout, digest, args.replicate)
+        duplicate = find_duplicate(layout, active, digest, args.replicate)
         if duplicate:
             print(
                 f"Already run as {duplicate['id']}; pass --replicate N for another sample.",
@@ -842,16 +898,43 @@ def compare_runs(original: Mapping[str, object], replay: Mapping[str, object], t
     return mismatches
 
 
-def replay(active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, run_id: str) -> bool:
-    """Re-run a recorded experiment from its spec, compare, and print the verdict."""
+def args_from_params(
+    parser: argparse.ArgumentParser, params: Mapping[str, object], replicate: int
+) -> argparse.Namespace:
+    """Recorded params parsed back through the adapter's parser, restoring each flag's type.
+
+    None means the flag's default; booleans are set directly (they have no
+    `--flag value` form).
+    """
+    argv, booleans = ["--replicate", str(replicate)], {}
+    for dest, value in sorted(params.items()):
+        if isinstance(value, bool):
+            booleans[dest] = value
+        elif value is not None:
+            argv += [_flag(dest), str(value)]
+    parsed = _parse_planned(parser, argv)
+    if isinstance(parsed, str):
+        raise HarnessError(f"cannot rebuild the run's arguments with the current adapter: {parsed}")
+    return argparse.Namespace(**{**vars(parsed), **booleans})
+
+
+def replay(
+    active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, slots: Slots, run_id: str
+) -> bool:
+    """Re-run a recorded experiment from its spec, compare, and print the verdict.
+
+    The re-run bypasses dedupe (that is its point) but not the machine's run slots.
+    """
     path = layout.runs_dir / f"{run_id}.json"
     if not path.exists():
         raise HarnessError(f"no run record {path}")
-    original = upgrade_record(json.loads(path.read_text()))
-    defaults = vars(parser.parse_args([]))
-    values = {**defaults, **original["params"], "replicate": original.get("replicate") or 0}
-    args = with_seed(active, argparse.Namespace(**values))
-    record = execute(active, layout, args, active.solver_identity(args), replay_of=run_id)
+    original = upgrade_record(json.loads(path.read_text()), active)
+    args = with_seed(active, args_from_params(parser, original["params"], original.get("replicate") or 0))
+    slot = acquire_slot(slots.dir, slots.capacity, report_waiting(slots.capacity))
+    try:
+        record = execute(active, layout, args, active.solver_identity(args), replay_of=run_id)
+    finally:
+        release(slot)
     mismatches = compare_runs(original, record, active.REPLAY_TOLERANCE)
     before = (original.get("provenance") or {}).get("solver_identity")
     print(json.dumps({
@@ -975,7 +1058,7 @@ def ensure_results_view(layout: Layout, active: ModuleType) -> None:
         f"CREATE INDEX IF NOT EXISTS idx_metric_{m} ON runs(json_extract(metrics, '$.{m}'));\n"
         for m, goal in active.METRICS.items() if goal
     )
-    with contextlib.closing(open_db(layout)) as db:
+    with campaign_db_lock(layout), contextlib.closing(open_db(layout, active)) as db:
         db.executescript(
             f"BEGIN IMMEDIATE;\nDROP VIEW IF EXISTS {RESULTS_VIEW};\n"
             f"CREATE VIEW {RESULTS_VIEW} AS SELECT {columns} FROM runs;\n{indexes}COMMIT;"
@@ -1113,12 +1196,17 @@ class _IdentityCache:
 
 def check_planned(
     active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, planned: list[batch.PlannedRun],
-    campaign: str, identity: _IdentityCache,
-) -> tuple[list[str], list[str], list[str]]:
-    """(argv per run to launch, already-recorded duplicates, errors), without running anything."""
-    launch, duplicates, errors, seen = [], [], [], set()
+    campaign: str, batch_id: str, identity: _IdentityCache,
+) -> tuple[list[list[str]], int, list[str]]:
+    """(argv per distinct run, how many of them are already recorded, errors), running nothing.
+
+    Planned runs that resolve to the same (spec hash, replicate) are launched
+    once. Already-recorded ones are still launched: their child answers
+    `duplicate_of` at once, which gives later stages their results.
+    """
+    argvs, recorded, errors, seen = [], 0, [], set()
     for i, run_plan in enumerate(planned):
-        argv = planned_argv(run_plan, campaign, "check")
+        argv = planned_argv(run_plan, campaign, batch_id)
         parsed = _parse_planned(parser, argv)
         if isinstance(parsed, str):
             errors.append(f"{run_plan.stage} run {i} {dict(run_plan.spec)}: {parsed}")
@@ -1129,12 +1217,9 @@ def check_planned(
         if key in seen:
             continue
         seen.add(key)
-        duplicate = find_duplicate(layout, digest, args.replicate)
-        if duplicate:
-            duplicates.append(duplicate["id"])
-        else:
-            launch.append(argv)
-    return launch, duplicates, errors
+        recorded += find_duplicate(layout, active, digest, args.replicate) is not None
+        argvs.append(argv)
+    return argvs, recorded, errors
 
 
 def _result_view(record: Mapping[str, object]) -> dict:
@@ -1150,48 +1235,68 @@ def _read_record(layout: Layout, run_id: str) -> dict:
     return upgrade_record(json.loads((layout.runs_dir / f"{run_id}.json").read_text()))
 
 
+def _child_result(proc: subprocess.Popen, stdout) -> dict:
+    stdout.seek(0)
+    lines = stdout.read().decode(errors="replace").strip().splitlines()
+    stdout.close()
+    return json.loads(lines[-1]) if lines else {}
+
+
 def launch_runs(
     layout: Layout, argvs: list[list[str]], parallel: int, same_crash: int,
     completed: list[dict], log: Path,
+    program: tuple[str, ...] = (sys.executable, str(REPO_ROOT / "run.py")),
 ) -> tuple[list[dict], str | None, int]:
-    """Run each argv as its own `run.py` process, `parallel` at a time.
+    """Run each argv as its own `program` process (default: run.py), `parallel` at a time.
 
-    Stops launching (in-flight runs finish) once the early-stop rule fires.
-    Returns (result views of this call's runs, stop reason or None, number of
-    children that exited without a result — their stderr is in `log`). On
-    cancellation, children are sent SIGTERM so each records itself as cancelled.
+    Children print to a temporary file, never a pipe, so a large result cannot
+    block them. A child that finds its spec running elsewhere (`in_progress`)
+    is retried after IN_PROGRESS_RETRY_SECONDS. Launching stops (in-flight
+    runs finish) once the early-stop rule fires. Returns (result views of this
+    call's runs, stop reason or None, number of children that exited without
+    a result — their stderr is in `log`). On cancellation, children are sent
+    SIGTERM so each records itself as cancelled.
     """
-    queue, running, results, stop, failed = list(argvs), [], [], None, 0
+    queue = [(0.0, argv) for argv in argvs]  # (not before, argv)
+    running: list[tuple[subprocess.Popen, object, list[str]]] = []
+    results, stop, failed = [], None, 0
     with open(log, "a") as stderr:
         try:
             while running or (queue and stop is None):
-                while queue and len(running) < parallel and stop is None:
-                    argv = queue.pop(0)
-                    running.append(subprocess.Popen(
-                        [sys.executable, str(REPO_ROOT / "run.py"), *argv],
-                        stdout=subprocess.PIPE, stderr=stderr, text=True,
-                    ))
-                finished = [proc for proc in running if proc.poll() is not None]
+                now = time.monotonic()
+                while stop is None and len(running) < parallel:
+                    ready = next((i for i, (at, _) in enumerate(queue) if at <= now), None)
+                    if ready is None:
+                        break
+                    argv = queue.pop(ready)[1]
+                    stdout = tempfile.TemporaryFile()
+                    proc = subprocess.Popen([*program, *argv], stdout=stdout, stderr=stderr)
+                    running.append((proc, stdout, argv))
+                finished = [entry for entry in running if entry[0].poll() is not None]
                 if not finished:
                     time.sleep(BATCH_POLL_SECONDS)
                     continue
-                for proc in finished:
-                    running.remove(proc)
-                    out = proc.communicate()[0].strip().splitlines()
-                    printed = json.loads(out[-1]) if out else {}
+                for entry in finished:
+                    running.remove(entry)
+                    proc, stdout, argv = entry
+                    printed = _child_result(proc, stdout)
+                    if printed.get("in_progress"):
+                        queue.append((time.monotonic() + IN_PROGRESS_RETRY_SECONDS, argv))
+                        continue
                     run_id = printed.get("id") or printed.get("duplicate_of")
                     if run_id is None:
-                        failed += proc.returncode != 0
+                        failed += 1
                         continue
                     view = {**_result_view(_read_record(layout, run_id)), "reused": "duplicate_of" in printed}
                     results.append(view)
                     completed.append(view)
                     stop = stop or batch.should_stop(completed, same_crash)
         except BaseException:
-            for proc in running:
+            for proc, _, _ in running:
                 proc.terminate()
-            for proc in running:
+            for proc, stdout, _ in running:
                 proc.wait()
+                stdout.close()
             raise
     return results, stop, failed
 
@@ -1225,15 +1330,21 @@ def run_batch(
     errors, previews = [], []
     for stage in plan.stages:
         if stage.source is None:
-            launch, duplicates, stage_errors = check_planned(
-                active, layout, parser, batch.plan_stage(stage), campaign, identity
+            argvs, recorded, stage_errors = check_planned(
+                active, layout, parser, batch.plan_stage(stage), campaign, "check", identity
             )
             errors += stage_errors
-            previews.append(f"{stage.name}: {len(launch)} to run, {len(duplicates)} already recorded")
+            previews.append(f"{stage.name}: {len(argvs) - recorded} to run, {recorded} already recorded")
         else:
             unknown = sorted(k for k in [*stage.base, *stage.carry] if k not in dests)
             if unknown:
                 errors.append(f"{stage.name}: unknown params {unknown}")
+            else:
+                # Carried values come from earlier runs; the stage's own values can be checked now.
+                _, _, base_errors = check_planned(
+                    active, layout, parser, [batch.PlannedRun(stage.name, stage.base, 0)], campaign, "check", identity
+                )
+                errors += base_errors
             previews.append(
                 f"{stage.name}: top {stage.top} of {stage.source} by {stage.rank_by} × {stage.replicates} replicates"
             )
@@ -1257,6 +1368,7 @@ def run_batch(
     results_by_stage: dict[str, list[dict]] = {}
     completed: list[dict] = []
     stop = None
+    failure = None
     lines = []
     try:
         for stage in plan.stages:
@@ -1268,31 +1380,28 @@ def run_batch(
                 selected = batch.select_runs(stage, results_by_stage.get(stage.source, []), active.METRICS)
                 params = {r["id"]: _read_record(layout, r["id"])["params"] for r in selected}
                 planned = batch.plan_promotion(stage, selected, params)
-            _, _, stage_errors = check_planned(active, layout, parser, planned, campaign, identity)
+            argvs, _, stage_errors = check_planned(active, layout, parser, planned, campaign, batch_id, identity)
             if stage_errors:
-                lines.append(f"{stage.name}: skipped, invalid promoted runs: {stage_errors[0]}")
-                continue
-            argvs = [planned_argv(p, campaign, batch_id) for p in planned]
+                failure = f"{stage.name}: invalid promoted runs: {stage_errors[0]}"
+                break
             results, stop, failed = launch_runs(layout, argvs, parallel, plan.same_crash_stop, completed, log)
             results_by_stage[stage.name] = results
             batch_record["stages"][stage.name] = [r["id"] for r in results]
             lines += _summary_lines(stage.name, results, active.METRICS)
             if failed:
                 lines.append(f"  {failed} runs exited without a result (see the stderr log)")
-        batch_record["status"] = "stopped" if stop else "done"
+        batch_record["status"] = "failed" if failure else "stopped" if stop else "done"
     except BaseException:
         batch_record["status"] = "cancelled"
         raise
     finally:
-        batch_record["stop_reason"] = stop
+        batch_record["stop_reason"] = failure or stop
         batch_record["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_atomic(record_path, json.dumps(batch_record, indent=1).encode())
-    head = (
-        f"batch {batch_id} · {len(completed)} runs · {round(time.monotonic() - started)}s · "
-        f"{'stopped: ' + stop if stop else 'done'}"
-    )
+    outcome = f"failed: {failure}" if failure else f"stopped: {stop}" if stop else "done"
+    head = f"batch {batch_id} · {len(completed)} runs · {round(time.monotonic() - started)}s · {outcome}"
     print("\n".join([head, *lines, f"details: {record_path} · children's stderr: {log}"]))
-    return 0
+    return 1 if failure else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1356,8 +1465,9 @@ def _dispatch(command: str, argv: list[str]) -> int:
         p.add_argument("--campaign", default=selection.campaign)
         p.add_argument("--from-jsonl", type=Path, help="first import records from an older results.jsonl")
         args = p.parse_args(argv)
-        imported = import_jsonl(layout, args.from_jsonl) if args.from_jsonl else 0
-        rows = rebuild(layout)
+        active = load_adapter(config.adapter)
+        imported = import_jsonl(layout, active, args.from_jsonl) if args.from_jsonl else 0
+        rows = rebuild(layout, active)
         print(json.dumps({"campaign": campaign_dir.name, "imported": imported, "rows": rows}))
         return 0
 
@@ -1400,7 +1510,8 @@ def _dispatch(command: str, argv: list[str]) -> int:
         p.add_argument("--campaign", default=selection.campaign)
         args = p.parse_args(argv)
         check_required_env(active, os.environ, campaign_dir)
-        return 0 if replay(active, layout, parser, args.run_id) else REPLAY_MISMATCH_EXIT
+        slots = resolve_slots(os.environ)
+        return 0 if replay(active, layout, parser, slots, args.run_id) else REPLAY_MISMATCH_EXIT
 
     if command == "batch":
         p = argparse.ArgumentParser(description="Run a planned batch of experiments (see batch.py)")

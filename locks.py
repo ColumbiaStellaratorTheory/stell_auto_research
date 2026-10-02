@@ -38,6 +38,15 @@ def try_lock(path: Path) -> int | None:
     return fd
 
 
+def acquire(path: Path, poll: float = 0.05) -> int:
+    """Block until `path` is exclusively locked; return the fd."""
+    while True:
+        fd = try_lock(path)
+        if fd is not None:
+            return fd
+        time.sleep(poll)
+
+
 def release(fd: int) -> None:
     if os.name == "nt":
         os.lseek(fd, 0, os.SEEK_SET)

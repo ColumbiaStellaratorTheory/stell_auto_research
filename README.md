@@ -135,7 +135,7 @@ so no flag is ever lost.
 - **Replay.** `python run.py replay <run-id>` re-runs a recorded experiment
   from its spec and compares status and metrics within the adapter's
   `REPLAY_TOLERANCE`; it exits 2 on a mismatch and says whether the solver
-  changed since.
+  changed since. A replay skips dedupe but still waits for a run slot.
 - **Rebuild.** `python run.py rebuild` regenerates `results.db` and
   `results.jsonl` from `runs/`. `--from-jsonl FILE` first imports records
   from an older harness's `results.jsonl`.
@@ -189,8 +189,10 @@ finishes. The format is documented at the top of `batch.py`:
 - **Before anything runs** every spec is parsed against the adapter's flags;
   any error stops the whole batch. `--dry-run` shows the plan and how many
   runs are already recorded.
-- **While it runs:** each spec is its own `run.py` process; specs already
-  recorded are reused, not re-run; launching stops once the last
+- **While it runs:** each distinct spec is its own `run.py` process (specs
+  repeated in the file run once); specs already recorded are reused, not
+  re-run; a spec another agent is running right now is waited for and then
+  reused; launching stops once the last
   `same_crash` runs crashed the same way (0 disables). Children's stderr goes
   to `batches/<id>.log`, so the summary stays short.
 - **Waiting is free:** run it in the background and read the summary when it
