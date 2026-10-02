@@ -19,17 +19,21 @@ adapter (banana coils on simsopt) lives in [`examples/banana/`](examples/banana/
 ## How it works
 
 ```
-run.py                    ← generic runner: selects the campaign, runs its adapter, stores results
-adapter.py                ← loads the adapter a campaign's config.json names
+run.py                    ← generic runner: selects the campaign, runs its adapter, records results
+adapter.py                ← looks up the adapter a campaign's config.json names
 contract.py               ← the harness↔adapter contract
+adapters/__init__.py      ← registry of installed adapters (static imports)
 adapters/<solver>.py      ← solver-specific glue (the only file that knows your solver)
 schema.sql                ← database schema (applied automatically)
 campaigns/<name>/
   config.json             ← which adapter + its settings (solver paths, interpreter)
   program.md              ← agent instructions for this campaign
   LESSONS.md              ← append-only research memory (agent + human)
-  results.db              ← experiment database (query with SQL)
-  results.jsonl           ← append-only log (human-readable backup)
+  runs/<run-id>.json      ← one record per run: the source of truth
+  blobs/                  ← evidence files (logs, results, solver patches) by content hash
+  results.db              ← query index of runs/ (query with SQL)
+  results.jsonl           ← flat export of runs/, written by `run.py rebuild`
+  scratch/                ← live run directories
 ```
 
 A **campaign** is one research goal: one solver, one objective, one set of hard
@@ -81,15 +85,16 @@ sqlite3 campaigns/demo/results.db -header -column \
 }
 ```
 
-- `adapter` — a module in `adapters/` (`"toy"`), or a dotted module path
-  (`"examples.banana.simsopt_banana"`).
+- `adapter` — a key in `adapters/__init__.py` `REGISTRY` (`"toy"`,
+  `"simsopt_banana"`).
 - `env` *(optional)* — settings the adapter reads (solver paths, the
   interpreter that has your solver installed). A variable already set in your
   shell overrides the config value. This avoids shell-specific `export`
   syntax.
 
-`config.json`, `results.*` and `artifacts/` are gitignored (machine-specific
-paths and run data); `program.md` and `LESSONS.md` are yours to commit or not.
+`config.json` and the run data (`runs/`, `blobs/`, `results.*`, `scratch/`,
+`artifacts/`) are gitignored; `program.md` and `LESSONS.md` are yours to commit
+or not.
 
 ## Architecture: core + adapter
 
@@ -98,17 +103,41 @@ lifecycle, and the agent-facing CLI skeleton — and nothing solver-specific. On
 experiment is:
 
 ```
-run.py  →  adapter.run_experiment(args, run_dir)  →  ExperimentOutcome  →  results.db / results.jsonl
+run.py  →  adapter.run_experiment(args, run)  →  ExperimentOutcome  →  runs/<id>.json  →  results.db
 ```
 
 The adapter (see `contract.py` for the interface) owns everything about your
 solver: which flags exist (`add_arguments`), which modes it has
 (`SOLVER_MODES`), which flag names the target configuration (`TARGET_FLAG`),
-and how to run one experiment end-to-end (`run_experiment`) — whether that's a
-single subprocess or a chained pipeline. It returns metrics as canonical keys;
-the core stores the ones with a dedicated column and preserves the rest in a
-`metrics` JSON blob, so every solver shares one schema. The core also records
-the full parsed command line of every run, so no flag is ever lost.
+which flag is its RNG seed (`SEED_FLAG`), what fingerprints its code
+(`solver_identity`), and how to run one experiment end-to-end
+(`run_experiment`) — whether that's a single subprocess or a chained pipeline.
+It returns metrics as canonical keys plus what the run used (provenance) and
+which files to keep (evidence). The core records the full parsed command line
+of every run, so no flag is ever lost.
+
+## Reproducibility
+
+- **Spec hash and dedupe.** Each run's `spec_hash` covers the adapter, every
+  flag except execution-only ones (timeout, threads, solver location) and the
+  solver identity (commit + uncommitted-diff hash). If a pass/fail run with
+  the same hash and `--replicate` index exists, `run.py` prints
+  `{"duplicate_of": ...}` instead of running it again. Crashes can always be
+  retried.
+- **Seeds.** If the solver has a seed flag and you leave it unset, the
+  harness derives one from the spec and `--replicate` (default 0). Repeats
+  are deliberate: `--replicate 1`, `2`, … draw new seeds.
+- **Provenance.** Every record keeps the solver identity, the exact solver
+  command, input-file hashes, the harness commit, and the platform.
+- **Evidence.** Files the adapter names (log, results, solver patch) are kept
+  in `blobs/` by content hash, whatever `KEEP_ARTIFACTS` says.
+- **Replay.** `python run.py replay <run-id>` re-runs a recorded experiment
+  from its spec and compares status and metrics within the adapter's
+  `REPLAY_TOLERANCE`; it exits 2 on a mismatch and says whether the solver
+  changed since.
+- **Rebuild.** `python run.py rebuild` regenerates `results.db` and
+  `results.jsonl` from `runs/`. `--from-jsonl FILE` first imports records
+  from an older harness's `results.jsonl`.
 
 ## Environment variables
 
@@ -116,7 +145,7 @@ the full parsed command line of every run, so no flag is ever lost.
 |----------|-------------|
 | `AUTORESEARCH_CAMPAIGN` | *(optional)* campaign to use when `--campaign` is not given. |
 | `AUTORESEARCH_CAMPAIGNS_DIR` | *(optional)* where campaigns live (default `<repo>/campaigns`). |
-| `OUTPUT_BASE` | *(optional)* scratch dir for live runs (default `/tmp/stellarator_harness`). Crashed runs leave their dir + `run.log` here for debugging. |
+| `OUTPUT_BASE` | *(optional)* scratch dir for live runs (default `campaigns/<name>/scratch`). |
 | `KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `ARTIFACTS_DIR/<run-id>`. |
 | `ARTIFACTS_DIR` | *(optional)* where kept run dirs land, named by run id (default `campaigns/<name>/artifacts`). |
 
@@ -124,10 +153,10 @@ Any of these can also go in a campaign's `config.json` `env` map.
 
 ## Results
 
-Every run writes to both the campaign's `results.jsonl` (flat file) and
+Every run is written to the campaign's `runs/<run-id>.json` and indexed in
 `results.db` (SQLite). The columns are the same for every solver;
-solver-specific metrics live in the `metrics` JSON column, and every flag of
-the run in the `params` JSON column.
+solver-specific metrics live in the `metrics` JSON column, every flag of the
+run in `params`, and provenance/evidence in their own JSON columns.
 
 ```bash
 DB=campaigns/<name>/results.db
@@ -138,8 +167,8 @@ sqlite3 $DB -header -column "SELECT * FROM runs WHERE status='pass' ORDER BY obj
 # a solver-specific metric or parameter from the JSON columns
 sqlite3 $DB "SELECT id, json_extract(metrics,'\$.<your_metric>'), json_extract(params,'\$.<your_flag>') FROM runs"
 
-# JSONL (for scripts, jq, grep)
-jq 'select(.status=="pass")' campaigns/<name>/results.jsonl
+# flat files (for scripts, jq, grep)
+jq 'select(.status=="pass")' campaigns/<name>/runs/*.json
 ```
 
 ## Autonomous agent usage
@@ -159,11 +188,11 @@ You never touch `run.py`. Either:
 
 1. Run `/setup-harness` — it detects your solver, installs deps, and generates
    the adapter and campaign for you; **or**
-2. Write `adapters/<your-solver>.py` implementing the `contract.py` interface
-   (`NAME`, `SOLVER_MODES`, `TARGET_FLAG`, `ENV_REQUIREMENTS`, `add_arguments`,
-   `run_experiment`), using `adapters/toy.py` as the template and
-   `examples/banana/simsopt_banana.py` for a multi-mode physics example, then
-   create `campaigns/<name>/config.json` with `"adapter": "<your-solver>"`.
+2. Write `adapters/<your-solver>.py` implementing the `contract.py` interface,
+   using `adapters/toy.py` as the template and
+   `examples/banana/simsopt_banana.py` for a multi-mode physics example;
+   register it in `adapters/__init__.py` (one import + one `REGISTRY` entry);
+   then create `campaigns/<name>/config.json` with `"adapter": "<your-solver>"`.
 
 `run_experiment` can run a single subprocess or a multi-step pipeline (e.g. a
 DESC chain: bumped surface → fixed-boundary equilibrium → coil optimization →
@@ -175,7 +204,8 @@ column.
 ```
 contract.py                     ← harness↔adapter contract (ExperimentOutcome, helpers)
 run.py                          ← generic experiment runner (solver-agnostic)
-adapter.py                      ← adapter loader
+adapter.py                      ← adapter lookup + contract check
+adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)
 examples/toy_solver.py          ← the toy adapter's solver
 examples/banana/                ← real-world example: banana coils on simsopt

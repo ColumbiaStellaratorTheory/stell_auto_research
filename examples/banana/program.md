@@ -47,7 +47,7 @@ python run.py --campaign banana --solver single-stage --equilibrium nfp5_iota20 
     --iota-target 0.20 --vol-target 0.10 --mpol 8 --timeout 1200
 ```
 
-Output: one JSON line to stdout, auto-written to both `campaigns/banana/results.jsonl` and `campaigns/banana/results.db`.
+Output: one JSON line to stdout. The run is recorded in `campaigns/banana/runs/` and indexed in `campaigns/banana/results.db`. An identical earlier pass/fail run is not repeated (`--replicate N` draws another seed); `python run.py replay <id>` re-runs one and compares.
 
 ### Parameters
 
@@ -96,6 +96,7 @@ sqlite3 campaigns/banana/results.db -header -column "YOUR QUERY"
 ```
 runs(
   id, coil_type, solver, equilibrium, experiment_group,
+  spec_hash, replicate, seed, parent_run_id, replay_of,
   status, status_reason, validated,
   iterations, elapsed, created_at, optimizer_success, termination_message,
   field_error, qs_error, boozer_residual,
@@ -104,7 +105,8 @@ runs(
   coil_length, coil_coil_dist, coil_surface_dist, surface_vessel_dist,
   max_force, self_intersecting, objective_J,
   metrics,  -- JSON: solver-specific metrics, e.g. json_extract(metrics, '$.lead_end_curvature')
-  params    -- JSON: run params, e.g. json_extract(params, '$.cc_weight')
+  params,   -- JSON: every flag of the run, e.g. json_extract(params, '$.cc_weight')
+  provenance, evidence  -- JSON: what the run used / kept files
 )
 ```
 

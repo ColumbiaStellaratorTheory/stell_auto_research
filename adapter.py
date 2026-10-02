@@ -1,48 +1,48 @@
-"""Solver-adapter loader.
+"""Solver-adapter lookup.
 
 The core never imports a solver directly. A campaign's `config.json` names its
-adapter as a module path: a bare name (`toy`) means `adapters.<name>`; a dotted
-path (`examples.banana.simsopt_banana`) is imported as given. The module must
-implement the contract in `contract.py`; `load_adapter` checks the required
-members before the core uses it.
+adapter by key in `adapters.REGISTRY` (static imports, see
+`adapters/__init__.py`); `load_adapter` checks that the adapter implements the
+contract in `contract.py` before the core uses it.
 """
 
 from __future__ import annotations
 
-import importlib
 from types import ModuleType
+
+from adapters import REGISTRY
 
 CONTRACT_MEMBERS = (
     "NAME",
     "SOLVER_MODES",
     "TARGET_FLAG",
-    "ENV_REQUIREMENTS",
+    "REQUIRED_ENV",
+    "OPTIONAL_ENV",
+    "EXECUTION_FLAGS",
+    "SEED_FLAG",
+    "REPLAY_TOLERANCE",
     "add_arguments",
+    "solver_identity",
     "run_experiment",
 )
 
 
 class AdapterError(Exception):
-    """The named adapter cannot be imported or does not implement the contract."""
+    """The named adapter is not registered or does not implement the contract."""
 
 
-def module_path(name: str) -> str:
-    """Resolve an adapter name from config.json to an importable module path."""
-    return name if "." in name else f"adapters.{name}"
-
-
-def load_adapter(name: str) -> ModuleType:
-    """Import the adapter `name` and verify it implements the contract."""
-    path = module_path(name)
-    try:
-        module = importlib.import_module(path)
-    except ImportError as e:
-        raise AdapterError(f"cannot import adapter '{path}': {e}") from e
-
+def load_adapter(name: str, registry: dict[str, ModuleType] = REGISTRY) -> ModuleType:
+    """Return the registered adapter `name`, verified against the contract."""
+    module = registry.get(name)
+    if module is None:
+        installed = ", ".join(sorted(registry)) or "none"
+        raise AdapterError(
+            f"no adapter '{name}' in adapters/__init__.py REGISTRY (installed: {installed})"
+        )
     missing = [m for m in CONTRACT_MEMBERS if not hasattr(module, m)]
     if missing:
         raise AdapterError(
-            f"adapter '{path}' does not implement the contract — missing "
+            f"adapter '{name}' does not implement the contract — missing "
             f"{', '.join(missing)} (see contract.py)."
         )
     return module

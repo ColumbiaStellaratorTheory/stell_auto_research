@@ -1,56 +1,81 @@
 """Shared harness↔adapter contract.
 
 The harness core (`run.py`) is solver-agnostic: it owns campaign selection, the
-experiment database, the scratch/artifact lifecycle, and the agent-facing CLI
-skeleton. Everything solver-specific — how to invoke a solver, what its outputs
-mean, how to validate a result — lives behind a *solver adapter* that the
-campaign's `config.json` names (see `adapter.py`). This module is the contract
-both sides import; it has no project dependencies so neither side imports the
-other.
+run records, the scratch/evidence lifecycle, and the agent-facing CLI skeleton.
+Everything solver-specific — how to invoke a solver, what its outputs mean,
+how to validate a result — lives behind a *solver adapter*, registered in
+`adapters/__init__.py` and named by the campaign's `config.json`. This module
+is the contract both sides import; it has no project dependencies so neither
+side imports the other.
 
 An adapter is a module exposing:
 
     NAME              str          — identifies the solver family; stored in the
                                      `coil_type` column.
-    SOLVER_MODES      tuple[str]   — the `--solver` choices the agent may pick;
-                                     SOLVER_MODES[0] is the default. A single-
-                                     stage solver exposes one mode; a chained
-                                     pipeline may expose several.
+    SOLVER_MODES      tuple[str]   — the `--solver` choices; SOLVER_MODES[0] is
+                                     the default.
     TARGET_FLAG       str          — argparse dest of the flag naming the target
-                                     configuration being optimized (e.g.
-                                     "equilibrium"); its value is stored in the
-                                     `equilibrium` column. The flag must always
-                                     have a value (give it a default).
-    ENV_REQUIREMENTS  tuple[str]   — env vars the adapter reads (informational,
-                                     for setup tooling).
-    add_arguments(parser) -> None  — register this solver's CLI flags, including
-                                     the TARGET_FLAG flag.
-    run_experiment(args, run_dir: Path) -> ExperimentOutcome
-                                   — run ONE experiment end-to-end in run_dir.
-                                     Owns the entire pipeline (one subprocess or
-                                     a chain of them), metric extraction,
-                                     classification, and any validation. Must
-                                     not raise for solver failures — return an
-                                     outcome with status "crash"/"fail".
+                                     configuration (e.g. "equilibrium"); stored
+                                     in the `equilibrium` column. Give it a
+                                     default so it always has a value.
+    REQUIRED_ENV      tuple[str]   — env vars that must be set before a run; the
+                                     core checks them and refuses to start
+                                     without them.
+    OPTIONAL_ENV      tuple[str]   — env vars read when present (informational).
+    EXECUTION_FLAGS   tuple[str]   — argparse dests that change how a run
+                                     executes but not what it computes (timeout,
+                                     thread count, solver location). Recorded,
+                                     but excluded from the spec hash.
+    SEED_FLAG         str | None   — argparse dest of the solver's RNG seed
+                                     flag (default None), or None for a
+                                     deterministic solver. When the agent leaves
+                                     it unset, the core derives a seed from the
+                                     spec and `--replicate`.
+    REPLAY_TOLERANCE  float        — largest relative difference per numeric
+                                     metric for which `run.py replay` reports a
+                                     match.
+    add_arguments(parser) -> None  — register the solver's CLI flags.
+    solver_identity(args) -> str   — fingerprint of the solver code that will
+                                     run (e.g. commit + uncommitted-diff hash).
+                                     Part of the spec hash, so a changed solver
+                                     is never mistaken for an earlier run.
+    run_experiment(args, run: RunContext) -> ExperimentOutcome
+                                   — run ONE experiment end-to-end in run.dir.
+                                     Must not raise for solver failures — return
+                                     an outcome with status "crash"/"fail".
 
-The core records the full parsed CLI of every run (every flag the adapter
-registered, defaults included), so an adapter never curates which knobs are
-kept.
+Adapters read environment variables when a run starts, never at import:
+every registered adapter is imported on every run, including campaigns that
+use a different one.
 
 A *canonical metric key* is a snake_case name an adapter emits in
 `ExperimentOutcome.metrics`. Keys that `run.py` projects into dedicated DB
 columns get their own column; every other key is preserved in the row's
-`metrics` JSON blob. Adapters map their solver's native output (e.g. UPPERCASE
-results.json keys) onto canonical keys so one schema serves every solver.
+`metrics` JSON blob.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
-import os
-import sys
+import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """Identity and scratch directory of the run an adapter is executing.
+
+    run_id: the run's id, final before the solver starts; use it to name
+        anything this run produces for later runs (e.g. an archived seed), so
+        their records can point back to this one as their parent.
+    dir: empty scratch directory for this run's solver outputs.
+    """
+
+    run_id: str
+    dir: Path
 
 
 @dataclass(frozen=True)
@@ -61,15 +86,20 @@ class ExperimentOutcome:
         (timeout, solver error, missing output). "fail" — ran but violated a
         gate (self-intersection, missing required metric, optimizer reported
         failure). "pass" — produced a complete, gate-passing result.
-    status_reason: short machine-readable tag, e.g. "ok", "timeout",
-        "self_intersecting", "no_seed".
+    status_reason: short machine-readable tag, e.g. "ok", "timeout".
     metrics: canonical-key → value. NaN/Inf are cleaned by the core, so adapters
         may pass raw solver floats.
     validated: independent-validation verdict ("pass"/"fail") when the adapter
         ran one (e.g. Poincaré field-line tracing), else None.
-    experiment_group: groups DB rows that belong to one logical experiment when
-        an adapter emits a row per pipeline sub-step; None when one experiment
-        is one row.
+    experiment_group: groups DB rows of one logical multi-step experiment;
+        None when one experiment is one row.
+    provenance: what the run actually used, as JSON-able values — the exact
+        solver command(s), solver commit, interpreter, hashes of input files.
+    evidence: name → file under run.dir worth keeping whatever the artifact
+        policy (results file, solver patch, log). The core stores each one by
+        content hash in the campaign and records the hashes.
+    parent_run_id: the earlier run this one built on (e.g. the run that
+        produced its warm-start seed), when known.
     """
 
     status: str
@@ -77,6 +107,9 @@ class ExperimentOutcome:
     metrics: Mapping[str, object] = field(default_factory=dict)
     validated: str | None = None
     experiment_group: str | None = None
+    provenance: Mapping[str, object] = field(default_factory=dict)
+    evidence: Mapping[str, Path] = field(default_factory=dict)
+    parent_run_id: str | None = None
 
 
 def clean(v: object) -> object:
@@ -86,20 +119,21 @@ def clean(v: object) -> object:
     return v
 
 
-def require_env(name: str) -> str:
-    """Return env var `name`, or exit(1) with an actionable message if unset.
+def sha256_file(path: Path) -> str:
+    """Hex SHA-256 of a file's contents, read in chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    For adapter configuration that has no safe default — solver paths, the
-    interpreter that has the solver installed. Set it in the campaign's
-    `config.json` "env" map or export it in the shell. Failing fast at import
-    beats a confusing crash mid-experiment.
-    """
-    val = os.environ.get(name)
-    if not val:
-        print(
-            f"ERROR: {name} not set. Add it to the campaign's config.json \"env\" "
-            f"map or export it before running run.py.",
-            file=sys.stderr,
+
+def git_output(root: Path, *git_args: str) -> str | None:
+    """Stdout of `git -C root <git_args>`, or None when git fails (not a checkout, no git)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *git_args], capture_output=True, text=True, timeout=60
         )
-        sys.exit(1)
-    return val
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None

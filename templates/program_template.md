@@ -77,8 +77,16 @@ python run.py --campaign {{CAMPAIGN_SLUG}} --solver {{EXAMPLE_SOLVER_MODE}} --{{
     {{EXAMPLE_MODE_PARAMS}} --timeout {{EXAMPLE_TIMEOUT}}
 ```
 
-Output: one JSON line to stdout, auto-written to both this campaign's
-`results.jsonl` and `results.db`.
+Output: one JSON line to stdout. The run is recorded in this campaign's
+`runs/` and indexed in `results.db`.
+
+- **No accidental repeats.** If an identical pass/fail run exists, `run.py`
+  prints `{"duplicate_of": "<id>"}` instead of running. Pass `--replicate N`
+  for another sample of the same spec (a new derived seed). Crashes can be
+  retried as-is.
+- **Replay.** `python run.py replay <run-id> --campaign {{CAMPAIGN_SLUG}}`
+  re-runs a recorded experiment and reports whether it matches. Replaying a
+  known run at the start of a session detects environment drift.
 
 ### Parameters
 
@@ -110,12 +118,12 @@ Enforced limits — do not go below/above:
 {{ARTIFACT_LAYOUT}}
 <!-- Table generated from /setup-harness setup answers:
      | Location | Path | Notes |
-     - OUTPUT_BASE: scratch for live runs; crashed runs leave dir + run.log
-       here for debugging
+     - OUTPUT_BASE: scratch for live runs (default campaigns/<slug>/scratch);
+       every run's log/results are kept as evidence under blobs/
      - ARTIFACTS_DIR + KEEP_ARTIFACTS policy: where completed runs' outputs
        are kept, named by run id (joins to results.db id)
      - any seed/intermediate store the adapter reuses across runs
-     - results.db / results.jsonl: campaigns/{{CAMPAIGN_SLUG}}/ -->
+     - runs/ (source of truth), blobs/, results.db: campaigns/{{CAMPAIGN_SLUG}}/ -->
 
 When you cite a champion in `LESSONS.md`, reference its artifact dir by run
 id so the result stays reproducible.
@@ -133,6 +141,7 @@ sqlite3 campaigns/{{CAMPAIGN_SLUG}}/results.db -header -column "YOUR QUERY"
 ```
 runs(
   id, coil_type, solver, equilibrium, experiment_group,
+  spec_hash, replicate, seed, parent_run_id, replay_of,
   status, status_reason, validated,
   iterations, elapsed, created_at, optimizer_success, termination_message,
   field_error, qs_error, boozer_residual,
@@ -141,7 +150,9 @@ runs(
   coil_length, coil_coil_dist, coil_surface_dist, surface_vessel_dist,
   max_force, self_intersecting, objective_J,
   metrics,  -- JSON: solver-specific metrics with no column; json_extract(metrics, '$.key')
-  params    -- JSON: every flag of the run, defaults included; json_extract(params, '$.key')
+  params,   -- JSON: every flag of the run, defaults included; json_extract(params, '$.key')
+  provenance, -- JSON: solver identity/commit, command, input hashes, harness commit, platform
+  evidence  -- JSON: kept files (name -> sha256) under blobs/
 )
 ```
 
@@ -155,13 +166,16 @@ solver is preserved in the `metrics` JSON blob.
 
 Hard-won defaults, not rules — override them when you have a reason:
 
-- Checking whether a config has already been run before launching saves
-  compute:
+- `run.py` already refuses exact repeats (same `spec_hash` + `replicate`);
+  query `params` to see what neighbouring configs were tried:
   ```sql
   SELECT COUNT(*) FROM runs
   WHERE equilibrium = '...' AND solver = '...'
   AND json_extract(params, '$.cc_weight') = ...;
   ```
+- Replicates of one spec differ only in `replicate` and the derived `seed`;
+  their spread is the noise floor for comparing configs. `parent_run_id`
+  links a run to the one it built on.
 - Aggregates (COUNT, GROUP BY, MIN, MAX) keep your context lean;
   unbounded SELECT * floods it.
 - **Only `validated = 'pass'` results are confirmed.** Scalar metrics can

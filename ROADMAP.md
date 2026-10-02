@@ -26,12 +26,12 @@ campaign  (one research goal)
 
 ## Step 2 — recording and replay
 
-- [ ] 8. Contract fields `SEED_FLAG`, `STOCHASTIC_MODES`, optional `provenance()`. Per-run manifest: exact argv, input-file hashes, solver commit + uncommitted-change patch, package versions, OS, CPU architecture, BLAS vendor.
-- [ ] 9. `spec_hash` (what was asked) vs `run_id` (this attempt); automatic dedupe, `--replicate` to force.
-- [ ] 10. Seeds derived from spec hash + replicate index; lineage via `parent_run_id`; seeds stored by content hash. Banana: `SEED_FLAG = "--basin-seed"`, map `basin_seed` → `rng_seed`, record warm-start seed and parent run.
-- [ ] 11. One record file per run written atomically (`os.replace`) as source of truth; `rebuild-db` regenerates the DB. Removes `fcntl` (Unix-only).
-- [ ] 12. Run folder named by run id; scratch defaults inside the campaign (gitignored), not `/tmp`; small evidence pack (manifest, log tail, key outputs) always kept.
-- [ ] 13. `run.py replay <id>` (re-run from manifest, compare within tolerance) and a session-start reference run that detects environment drift.
+- [x] 8. Contract: `RunContext`, `REQUIRED_ENV`/`OPTIONAL_ENV` (checked before a run; adapters no longer read env at import), `EXECUTION_FLAGS`, `SEED_FLAG`, `REPLAY_TOLERANCE`, `solver_identity()`; outcomes carry `provenance`, `evidence`, `parent_run_id`. Static adapter registry (`adapters/__init__.py`) replaces runtime imports. Per-run provenance: solver identity, exact command(s), input-file hashes, solver commit + uncommitted patch, harness commit, OS/arch/Python. (`STOCHASTIC_MODES` dropped: every run gets a seed. Package versions and BLAS vendor are left to adapters.)
+- [x] 9. `spec_hash` (adapter + non-execution flags + solver identity) vs `run_id`; a pass/fail run with the same hash and `--replicate` is not repeated; crashes can be retried.
+- [x] 10. Seeds derived from the spec (minus seed and execution flags) + replicate, independent of solver identity; explicit seeds win. Lineage via `parent_run_id`. Banana: `--basin-seed` flag, stage2 seeds archived under their run id with an origin file, single-stage records warm-start seed path + sha256 and its parent run; seed choice ties broken by name. (A machine-wide content-addressed seed store stays in item 28.)
+- [x] 11. One record file per run (`runs/<id>.json`, atomic `os.replace`) as source of truth; `run.py rebuild [--from-jsonl FILE]` regenerates `results.db` and `results.jsonl` and imports legacy records; outdated DB schemas are refused with the rebuild command. `fcntl` removed.
+- [x] 12. Run folder named by run id; scratch defaults to `<campaign>/scratch`; evidence files named by the adapter (log, results, solver patch, coils) always kept in `<campaign>/blobs/` by content hash. Stdout leaves out provenance/evidence.
+- [x] 13. `run.py replay <id>` re-runs from the recorded spec, compares status + metrics within the adapter's `REPLAY_TOLERANCE`, reports solver changes, exits 2 on mismatch. Session-start drift check = replaying a known run (documented in the program template).
 
 ## Step 3 — analysis and token efficiency
 

@@ -27,14 +27,16 @@ honest; the value you deliver is a working runner + bookkeeping, not physics.
 
 Read these before asking anything:
 1. `contract.py` — the harness↔adapter contract. This is the interface the
-   generated adapter must implement (`NAME`, `SOLVER_MODES`, `ENV_REQUIREMENTS`,
-   `add_arguments`, `run_experiment`) and the `ExperimentOutcome` it returns.
+   generated adapter must implement (its module docstring lists every member)
+   and the `RunContext` / `ExperimentOutcome` types it uses.
 2. `run.py` — the generic core: campaign selection (`--campaign`, one folder
    per campaign under `campaigns/`), `config.json` (`adapter` + `env`), how it
-   calls the adapter, the artifact layout (`OUTPUT_BASE` / `KEEP_ARTIFACTS` /
-   `ARTIFACTS_DIR`), and `COLUMN_METRIC_KEYS` (the canonical metric keys that
-   get their own DB column; everything else an adapter emits lands in the
-   `metrics` JSON overflow). The core records every parsed flag of a run.
+   calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
+   hash / dedupe / derived seeds / replay, the artifact layout (`OUTPUT_BASE` /
+   `KEEP_ARTIFACTS` / `ARTIFACTS_DIR`), and `COLUMN_METRIC_KEYS` (the canonical
+   metric keys that get their own DB column; everything else an adapter emits
+   lands in the `metrics` JSON overflow). The core records every parsed flag.
+   `adapters/__init__.py` is the registry of installed adapters.
 3. `adapters/toy.py` — the **reference adapter**: a complete, stdlib-only
    example of the contract. You will model the generated adapter on this.
    `examples/banana/simsopt_banana.py` is a real physics adapter showing
@@ -56,7 +58,7 @@ Ask the user (AskUserQuestion, with detected defaults where possible):
 
 Verify each path immediately (dir exists; interpreter runs). If the user's
 optimizer **is** the banana/simsopt example, no adapter generation is needed —
-use `"adapter": "examples.banana.simsopt_banana"` (see
+use `"adapter": "simsopt_banana"` (see
 `examples/banana/config.example.json` and `examples/banana/README.md`), skip
 Phase 6's adapter step, and just do dependency check + campaign identity +
 campaign folder + smoke. Otherwise you will generate a new adapter for their
@@ -117,9 +119,10 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   as baseline).
 - **Execution policy**: timeout and thread count for this machine; autonomy
   ("never stop" loop vs bounded sessions).
-- **Artifact layout**: `OUTPUT_BASE` (scratch; crashed runs leave dir + run.log
-  here), `KEEP_ARTIFACTS` (`none`/`pass`/`all`; recommend `pass`), `ARTIFACTS_DIR`,
-  and any solver-specific seed/intermediate store the adapter needs.
+- **Artifact layout**: `OUTPUT_BASE` (scratch, default `campaigns/<slug>/scratch`),
+  `KEEP_ARTIFACTS` (`none`/`pass`/`all` — whole run dirs; the adapter's evidence
+  files are kept regardless), `ARTIFACTS_DIR`, and any solver-specific
+  seed/intermediate store the adapter needs.
 - **Experiment granularity (multi-step pipelines only)**: ask whether one
   experiment should be **one DB row** (simplest — one row per full pipeline run)
   or **one row per sub-step** (more plumbing, but lets the agent reuse an
@@ -135,22 +138,32 @@ freedom; physics findings belong in `LESSONS.md`, not here.
    - `NAME`, `SOLVER_MODES` (the `--solver` choices; a single-shot solver has
      one mode, a pipeline may expose several), `TARGET_FLAG` (the argparse
      dest of the flag naming the target configuration, e.g. `"equilibrium"`),
-     `ENV_REQUIREMENTS`.
+     `REQUIRED_ENV` / `OPTIONAL_ENV`, `EXECUTION_FLAGS` (dests that change how
+     a run executes but not its result: timeout, threads, solver location),
+     `SEED_FLAG` (the solver's RNG seed flag dest with default `None`, or
+     `None` if the solver is deterministic), `REPLAY_TOLERANCE` (relative
+     per-metric tolerance for `run.py replay`; say in a comment whether it was
+     measured or is a starting value).
    - `add_arguments(parser)` — register the target flag (with a default) plus
      every solver param the agent may set, with the solver's real defaults.
      Only flags the solver actually supports. The core records every flag, so
      there is no list of "kept" params to maintain.
-   - `run_experiment(args, run_dir)` — run one experiment end-to-end (one
-     subprocess, or the full chain), parse outputs, map metrics → canonical keys,
-     classify pass/fail, run any validation, archive any reusable intermediate,
-     and return an `ExperimentOutcome`. Must not raise on solver failure — return
-     a `crash`/`fail` outcome (the core catches truly-unexpected exceptions).
-     For per-step granularity, emit one outcome per step with `experiment_group`.
-   - Read config via `require_env` from `contract.py` (fail-fast at import).
-   - Do **not** edit `adapter.py` or `run.py` — the campaign's `config.json`
-     selects the adapter (next step).
-2. **`campaigns/<slug>/config.json`** — `{"adapter": "<module>", "env": {...}}`
-   from the interview: the adapter module name, plus the solver root,
+   - `solver_identity(args)` — fingerprint of the solver code (commit + hash
+     of uncommitted changes via `contract.git_output`, or a file hash).
+   - `run_experiment(args, run)` — run one experiment end-to-end in `run.dir`
+     (one subprocess, or the full chain), parse outputs, map metrics →
+     canonical keys, classify pass/fail, run any validation, archive any
+     reusable intermediate under `run.run_id` (and set `parent_run_id` when a
+     run reuses one), and return an `ExperimentOutcome` with `provenance`
+     (exact command(s), input-file hashes) and `evidence` (log, results file,
+     solver patch). Must not raise on solver failure — return a `crash`/`fail`
+     outcome (the core catches truly-unexpected exceptions).
+   - Read env vars inside `run_experiment` / `solver_identity`, never at
+     import: every registered adapter is imported on every run.
+   - **Register it** in `adapters/__init__.py`: one import line and one
+     `REGISTRY` entry. Do **not** edit `adapter.py` or `run.py`.
+2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...}}`
+   from the interview: the adapter's `REGISTRY` key, plus the solver root,
    interpreter, config dir, and any non-default artifact-layout values in
    `env`. Omit anything left at default. No shell exports are needed.
 3. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
@@ -166,10 +179,12 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 
 1. Run one tiny experiment with `python run.py --campaign <slug> ...` and the
    smallest meaningful settings (low iterations/resolution, short timeout).
-   Expect a single JSON line with a `"status"` and a new row in both
-   `campaigns/<slug>/results.jsonl` and `campaigns/<slug>/results.db`.
-2. If it crashes, read the run log (path printed in stderr / under
-   `OUTPUT_BASE`), diagnose (usually a missing dep, an adapter↔solver flag
+   Expect a single JSON line with a `"status"`, a record in
+   `campaigns/<slug>/runs/`, and a row in `campaigns/<slug>/results.db`. Then
+   run `python run.py replay <run-id> --campaign <slug>` and confirm it matches.
+2. If it crashes, read the run log (the record's `evidence.log.sha256` names
+   the file under `campaigns/<slug>/blobs/`), diagnose (usually a missing dep,
+   an adapter↔solver flag
    mismatch, target-config resolution, or a broken pipeline step), fix, re-run.
    Do not declare setup done with a failing smoke run.
 3. For a chained pipeline, run one reduced-resolution full parameter set to prove

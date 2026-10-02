@@ -12,65 +12,81 @@ campaign on a simsopt fork. Two solver modes:
 Each mode is one subprocess against the fork's solver scripts. Unlike the toy
 reference adapter (adapters/toy.py) it shows multiple modes, a warm-start seed
 store shared between them, and independent validation. A campaign selects it
-with `"adapter": "examples.banana.simsopt_banana"` in its config.json.
+with `"adapter": "simsopt_banana"` in its config.json.
 
-Configuration is read from the environment at import (fail-fast); see
-ENV_REQUIREMENTS. Script paths default to the fork's standard layout and may be
-overridden per fork via STAGE2_SCRIPT / SINGLE_STAGE_SCRIPT / POINCARE_SCRIPT.
+Configuration is read from the environment when a run starts (the core checks
+REQUIRED_ENV first). Script paths default to the fork's standard layout and may
+be overridden per fork via STAGE2_SCRIPT / SINGLE_STAGE_SCRIPT / POINCARE_SCRIPT.
+
+Stage 2 runs archive their coils into a seed store under a directory named by
+their run id; a single-stage run records the seed it warm-started from (path +
+content hash) and that stage2 run as its parent.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import shutil
 import subprocess
 import sys
-import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
-from contract import ExperimentOutcome, require_env
+from contract import ExperimentOutcome, RunContext, git_output, sha256_file
 
 # --- Contract surface -------------------------------------------------------
 
 NAME = "banana"
 SOLVER_MODES = ("stage2", "single-stage")
 TARGET_FLAG = "equilibrium"
-ENV_REQUIREMENTS = (
-    "SIMSOPT_ROOT",
-    "SIMSOPT_PYTHON",
-    "EQUILIBRIA_DIR",
-    "STAGE2_SCRIPT",
-    "SINGLE_STAGE_SCRIPT",
-    "POINCARE_SCRIPT",
-    "STAGE2_SEED_DIR",
-)
+REQUIRED_ENV = ("SIMSOPT_ROOT", "SIMSOPT_PYTHON", "EQUILIBRIA_DIR")
+OPTIONAL_ENV = ("STAGE2_SCRIPT", "SINGLE_STAGE_SCRIPT", "POINCARE_SCRIPT", "STAGE2_SEED_DIR")
+EXECUTION_FLAGS = ("timeout", "omp_threads", "solver_root", "solver_python")
+SEED_FLAG = "basin_seed"
+# Starting value, not measured: OpenMP reductions make L-BFGS runs differ in the
+# last digits between repeats. Calibrate it by replaying a few runs.
+REPLAY_TOLERANCE = 1e-6
 
-# --- Configuration (env-driven; resolved once at import) --------------------
-
-EQUILIBRIA_DIR = Path(require_env("EQUILIBRIA_DIR"))
-DEFAULT_SOLVER_ROOT = Path(require_env("SIMSOPT_ROOT"))
-DEFAULT_SOLVER_PYTHON = require_env("SIMSOPT_PYTHON")
-
-# Solver script paths are relative to the solver root. Override via env when a
-# fork keeps these scripts elsewhere.
-SCRIPTS = {
-    "stage2": os.environ.get(
-        "STAGE2_SCRIPT",
-        "examples/single_stage_optimization/STAGE_2/banana_coil_solver.py",
-    ),
-    "single-stage": os.environ.get(
-        "SINGLE_STAGE_SCRIPT",
-        "examples/single_stage_optimization/SINGLE_STAGE/single_stage_banana_example.py",
-    ),
+# Solver script defaults, relative to the solver root (the fork's standard layout).
+DEFAULT_SCRIPTS = {
+    "stage2": "examples/single_stage_optimization/STAGE_2/banana_coil_solver.py",
+    "single-stage": "examples/single_stage_optimization/SINGLE_STAGE/single_stage_banana_example.py",
+    "poincare": "examples/single_stage_optimization/POINCARE_PLOTTING/poincare_surfaces.py",
 }
+SCRIPT_ENV = {"stage2": "STAGE2_SCRIPT", "single-stage": "SINGLE_STAGE_SCRIPT", "poincare": "POINCARE_SCRIPT"}
+DEFAULT_SEED_STORE = Path(__file__).resolve().parents[2] / "stage2_seeds"
+SEED_ORIGIN_FILE = "origin.json"
 
-# Stage 2 seed archive that single-stage warm-starts from.
-STAGE2_SEED_STORE = Path(
-    os.environ.get("STAGE2_SEED_DIR", str(Path(__file__).resolve().parents[2] / "stage2_seeds"))
-)
+
+@dataclass(frozen=True)
+class BananaConfig:
+    """Adapter configuration, read from the environment when a run starts.
+
+    scripts: mode ("stage2" / "single-stage" / "poincare") → script path
+        relative to the solver root, overridable per fork via SCRIPT_ENV.
+    seed_store: Stage 2 seed archive that single-stage warm-starts from.
+    """
+
+    equilibria_dir: Path
+    solver_root: Path
+    solver_python: str
+    scripts: Mapping[str, str]
+    seed_store: Path
+
+
+def config_from_env(environ: Mapping[str, str]) -> BananaConfig:
+    return BananaConfig(
+        equilibria_dir=Path(environ["EQUILIBRIA_DIR"]),
+        solver_root=Path(environ["SIMSOPT_ROOT"]),
+        solver_python=environ["SIMSOPT_PYTHON"],
+        scripts={mode: environ.get(SCRIPT_ENV[mode], path) for mode, path in DEFAULT_SCRIPTS.items()},
+        seed_store=Path(environ.get("STAGE2_SEED_DIR", str(DEFAULT_SEED_STORE))),
+    )
 
 # Single-stage runs Poincaré validation only when the field error clears this
 # bar; tighter than the survival bar so validation isn't wasted on bad fits.
@@ -128,6 +144,7 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--num-quadpoints", type=int, default=128)
     p.add_argument("--basin-hops", type=int, default=0)
     p.add_argument("--basin-stepsize", type=float, default=0.01)
+    p.add_argument("--basin-seed", type=int, default=None, help="basin-hopping RNG seed (default: derived by the harness)")
 
     # Single-stage only
     p.add_argument("--iota-target", type=float, default=0.15)
@@ -159,33 +176,46 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
 
 # --- Equilibrium + seed resolution ------------------------------------------
 
-def _resolve_equilibrium(eq_key: str) -> str:
+def _resolve_equilibrium(eq_key: str, equilibria_dir: Path) -> str:
     """Map an equilibrium key (registry alias or raw wout filename) to a wout
-    filename present in EQUILIBRIA_DIR. Raises KeyError if neither resolves."""
+    filename present in equilibria_dir. Raises KeyError if neither resolves."""
     filename = EQUILIBRIUM_FILES.get(eq_key)
     if filename:
         return filename
-    if (EQUILIBRIA_DIR / eq_key).exists():
+    if (equilibria_dir / eq_key).exists():
         return eq_key
     raise KeyError(eq_key)
 
 
-def _resolve_stage2_seed(args: argparse.Namespace, plasma_surf: str) -> str | None:
-    """Find the best Stage 2 seed matching equilibrium + geometry, or None."""
+def _seed_parent_run(bs_file: Path) -> str | None:
+    """Run id of the stage2 run that archived this seed, if it recorded one."""
+    origin = bs_file.parent / SEED_ORIGIN_FILE
+    try:
+        return json.loads(origin.read_text()).get("run_id")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_stage2_seed(args: argparse.Namespace, plasma_surf: str, seed_store: Path) -> str | None:
+    """Find the best Stage 2 seed matching equilibrium + geometry, or None.
+
+    Ties on field error go to the first seed directory by name, so the choice
+    does not depend on filesystem listing order.
+    """
     if args.stage2_bs_path:
         if Path(args.stage2_bs_path).is_file():
             return args.stage2_bs_path
         print(f"ERROR: seed not found: {args.stage2_bs_path}", file=sys.stderr)
         return None
 
-    seeds_parent = STAGE2_SEED_STORE / f"outputs-{plasma_surf}"
+    seeds_parent = seed_store / f"outputs-{plasma_surf}"
     if not seeds_parent.is_dir():
         print(f"No seeds for {args.equilibrium}. Run Stage 2 first.", file=sys.stderr)
         return None
 
     best_seed = None
     best_fe = float("inf")
-    for seed_dir in seeds_parent.iterdir():
+    for seed_dir in sorted(seeds_parent.iterdir()):
         bs_file = seed_dir / "biot_savart_opt.json"
         results_file = seed_dir / "results.json"
         if not bs_file.is_file():
@@ -222,11 +252,13 @@ def _resolve_stage2_seed(args: argparse.Namespace, plasma_surf: str) -> str | No
 
 # --- CLI building -----------------------------------------------------------
 
-def _build_cli(args: argparse.Namespace, plasma_surf: str, run_dir: Path) -> list[str] | None:
-    """Build the solver subprocess args (incl. --output-root). None on seed miss."""
+def _build_cli(
+    args: argparse.Namespace, plasma_surf: str, seed: str | None, config: BananaConfig, run_dir: Path
+) -> list[str]:
+    """Build the solver subprocess args (incl. --output-root)."""
     common = [
         "--plasma-surf-filename", plasma_surf,
-        "--equilibria-dir", str(EQUILIBRIA_DIR),
+        "--equilibria-dir", str(config.equilibria_dir),
         "--nphi", str(args.nphi),
         "--ntheta", str(args.ntheta),
         "--maxiter", str(args.maxiter),
@@ -249,13 +281,9 @@ def _build_cli(args: argparse.Namespace, plasma_surf: str, run_dir: Path) -> lis
             "--num-quadpoints", str(args.num_quadpoints),
             "--basin-hops", str(args.basin_hops),
             "--basin-stepsize", str(args.basin_stepsize),
+            "--basin-seed", str(args.basin_seed),
         ]
         return common + mode_args + ["--output-root", str(run_dir)]
-
-    # Single-stage: resolve a warm-start seed first.
-    seed = _resolve_stage2_seed(args, plasma_surf)
-    if seed is None:
-        return None
 
     mode_args = [
         "--stage2-bs-path", seed,
@@ -331,17 +359,13 @@ def _is_missing(v: object) -> bool:
 
 # --- Poincaré validation ----------------------------------------------------
 
-def _run_poincare(run_dir: Path, solver_python: str, solver_root: Path) -> str | None:
+def _run_poincare(run_dir: Path, solver_python: str, poincare_script: Path) -> str | None:
     """Trace field lines and judge confinement. Returns 'pass'/'fail' or None.
 
     The Poincaré script prints phi hit counts to stdout. Field lines that exit
     the surface produce fewer hits; uniformity across phi slices (min/max)
     indicates confinement quality.
     """
-    poincare_script = solver_root / os.environ.get(
-        "POINCARE_SCRIPT",
-        "examples/single_stage_optimization/POINCARE_PLOTTING/poincare_surfaces.py",
-    )
     if not poincare_script.exists():
         print(f"Poincare script not found: {poincare_script}", file=sys.stderr)
         return None
@@ -388,61 +412,121 @@ def _run_poincare(run_dir: Path, solver_python: str, solver_root: Path) -> str |
     return None
 
 
-def _archive_stage2_seed(run_dir: Path, plasma_surf: str) -> None:
-    """Copy a Stage 2 biot_savart_opt.json (+ results.json) into the seed store."""
-    bs_files = list(run_dir.rglob("biot_savart_opt.json"))
+def _archive_stage2_seed(run: RunContext, plasma_surf: str, seed_store: Path) -> None:
+    """Copy a Stage 2 biot_savart_opt.json (+ results.json) into the seed store.
+
+    The seed directory is named by the run id and carries an origin file, so a
+    single-stage run that warm-starts from it can record this run as its parent.
+    """
+    bs_files = sorted(run.dir.rglob("biot_savart_opt.json"))
     if not bs_files:
         return
-    ts = int(time.time() * 1000)
-    seed_dir = STAGE2_SEED_STORE / f"outputs-{plasma_surf}" / f"{bs_files[0].parent.name}-{ts}"
+    seed_dir = seed_store / f"outputs-{plasma_surf}" / run.run_id
     seed_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(bs_files[0], seed_dir / "biot_savart_opt.json")
-    results_files = list(run_dir.rglob("results.json"))
+    results_files = sorted(run.dir.rglob("results.json"))
     if results_files:
         shutil.copy2(results_files[0], seed_dir / "results.json")
+    (seed_dir / SEED_ORIGIN_FILE).write_text(json.dumps({"run_id": run.run_id}))
+
+
+# --- Provenance -------------------------------------------------------------
+
+def _solver_root(args: argparse.Namespace, config: BananaConfig) -> Path:
+    return Path(args.solver_root) if args.solver_root else config.solver_root
+
+
+def _solver_state(root: Path) -> tuple[str | None, str]:
+    """(commit, uncommitted diff against HEAD) of the solver checkout."""
+    commit = git_output(root, "rev-parse", "HEAD")
+    diff = git_output(root, "diff", "HEAD") or ""
+    return (commit.strip() if commit else None), diff
+
+
+def solver_identity(args: argparse.Namespace) -> str:
+    """Solver commit, plus a hash of any uncommitted changes."""
+    root = _solver_root(args, config_from_env(os.environ))
+    commit, diff = _solver_state(root)
+    if commit is None:
+        return f"unversioned:{root}"
+    if not diff:
+        return commit
+    return f"{commit}+dirty:{hashlib.sha256(diff.encode()).hexdigest()[:16]}"
 
 
 # --- Experiment entry point -------------------------------------------------
 
-def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome:
-    """Run one banana experiment end-to-end in run_dir; return its outcome."""
-    solver_root = Path(args.solver_root) if args.solver_root else DEFAULT_SOLVER_ROOT
-    solver_python = args.solver_python or DEFAULT_SOLVER_PYTHON
-    solver_script = solver_root / SCRIPTS[args.solver]
+def run_experiment(args: argparse.Namespace, run: RunContext) -> ExperimentOutcome:
+    """Run one banana experiment end-to-end in run.dir; return its outcome."""
+    config = config_from_env(os.environ)
+    solver_root = _solver_root(args, config)
+    solver_python = args.solver_python or config.solver_python
+    solver_script = solver_root / config.scripts[args.solver]
+
+    commit, diff = _solver_state(solver_root)
+    provenance: dict[str, object] = {
+        "solver_root": str(solver_root),
+        "solver_commit": commit,
+        "solver_dirty": bool(diff),
+        "solver_python": solver_python,
+    }
+    log_path = run.dir / "run.log"
+    evidence: dict[str, Path] = {"log": log_path}
+    if diff:
+        patch_path = run.dir / "solver.patch"
+        patch_path.write_text(diff)
+        evidence["solver_patch"] = patch_path
+
+    def outcome(status: str, reason: str, **fields: object) -> ExperimentOutcome:
+        return ExperimentOutcome(status, reason, provenance=provenance, evidence=evidence, **fields)
 
     try:
-        plasma_surf = _resolve_equilibrium(args.equilibrium)
+        plasma_surf = _resolve_equilibrium(args.equilibrium, config.equilibria_dir)
     except KeyError:
-        return ExperimentOutcome("crash", "unknown_equilibrium")
+        return outcome("crash", "unknown_equilibrium")
+    equilibrium_path = config.equilibria_dir / plasma_surf
+    provenance["equilibrium_file"] = str(equilibrium_path)
+    if equilibrium_path.is_file():
+        provenance["equilibrium_sha256"] = sha256_file(equilibrium_path)
 
-    cli_args = _build_cli(args, plasma_surf, run_dir)
-    if cli_args is None:
-        return ExperimentOutcome("crash", "no_seed")
+    seed = None
+    parent_run_id = None
+    if args.solver == "single-stage":
+        seed = _resolve_stage2_seed(args, plasma_surf, config.seed_store)
+        if seed is None:
+            return outcome("crash", "no_seed")
+        parent_run_id = _seed_parent_run(Path(seed))
+        provenance["warm_start_seed"] = seed
+        provenance["warm_start_seed_sha256"] = sha256_file(Path(seed))
 
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(args.omp_threads)
     env["MKL_NUM_THREADS"] = str(args.omp_threads)
 
-    cmd = [solver_python, str(solver_script)] + cli_args
-    log_path = run_dir / "run.log"
+    cmd = [solver_python, str(solver_script)] + _build_cli(args, plasma_surf, seed, config, run.dir)
+    provenance["command"] = cmd
     try:
         with open(log_path, "w") as lf:
             result = subprocess.run(
                 cmd, stdout=lf, stderr=subprocess.STDOUT, env=env, timeout=args.timeout,
             )
     except subprocess.TimeoutExpired:
-        return ExperimentOutcome("crash", "timeout")
+        return outcome("crash", "timeout", parent_run_id=parent_run_id)
     if result.returncode != 0:
-        return ExperimentOutcome("crash", f"exit_{result.returncode}")
+        return outcome("crash", f"exit_{result.returncode}", parent_run_id=parent_run_id)
 
-    results_files = list(run_dir.rglob("results.json"))
+    results_files = sorted(run.dir.rglob("results.json"))
     if not results_files:
-        return ExperimentOutcome("crash", "no_results_json")
+        return outcome("crash", "no_results_json", parent_run_id=parent_run_id)
     try:
         with open(results_files[0]) as f:
             raw = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        return ExperimentOutcome("crash", f"bad_results_json: {e}")
+        return outcome("crash", f"bad_results_json: {e}", parent_run_id=parent_run_id)
+    evidence["results"] = results_files[0]
+    coil_files = sorted(run.dir.rglob("biot_savart_opt.json"))
+    if coil_files:
+        evidence["coils"] = coil_files[0]
 
     metrics = _map_metrics(raw)
     status, status_reason = _classify(metrics, args.solver)
@@ -452,19 +536,16 @@ def run_experiment(args: argparse.Namespace, run_dir: Path) -> ExperimentOutcome
         fe = metrics.get("field_error")
         if fe is not None and not _is_missing(fe) and fe < POINCARE_FIELD_ERROR_THRESHOLD:
             try:
-                validated = _run_poincare(run_dir, solver_python, solver_root)
+                validated = _run_poincare(run.dir, solver_python, solver_root / config.scripts["poincare"])
             except Exception as e:
                 print(f"WARNING: Poincare validation failed: {e}", file=sys.stderr)
 
     if args.solver == "stage2":
         try:
-            _archive_stage2_seed(run_dir, plasma_surf)
+            _archive_stage2_seed(run, plasma_surf, config.seed_store)
         except Exception as e:
             print(f"WARNING: seed archival failed: {e}", file=sys.stderr)
 
-    return ExperimentOutcome(
-        status=status,
-        status_reason=status_reason,
-        metrics=metrics,
-        validated=validated,
+    return outcome(
+        status, status_reason, metrics=metrics, validated=validated, parent_run_id=parent_run_id
     )
