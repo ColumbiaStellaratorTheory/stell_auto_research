@@ -6,6 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 # The harness itself (run.py, the toy reference adapter, tests) is
 # stdlib-only. Solver dependencies live in the interpreter each adapter
-# invokes (named in the campaign's config.json), not in this project's
+# invokes (named in the campaign's local.json), not in this project's
 # environment.
 dependencies = []
