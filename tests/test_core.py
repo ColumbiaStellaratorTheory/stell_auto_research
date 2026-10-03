@@ -42,6 +42,7 @@ import runner
 from adapters import toy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+NO_LIMITS = runner.Limits({}, {}, campaign.Budget())
 
 
 def _make_campaign(root: Path, name: str, config: dict) -> Path:
@@ -52,7 +53,7 @@ def _make_campaign(root: Path, name: str, config: dict) -> Path:
 
 
 def _toy_args(**overrides) -> argparse.Namespace:
-    values = vars(run.build_parser(toy, "demo").parse_args([]))
+    values = vars(runner.build_parser(toy, "demo").parse_args([]))
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -674,7 +675,7 @@ class TestLocksAndSlots(_ScratchDirTest):
         digest = runner.spec_hash(toy, runner.run_spec(args), toy.solver_identity(args))
         claim = locks.try_lock(layout.claims_dir / f"{digest}-0.lock")
         self.addCleanup(locks.release, claim)
-        printed = runner.run_once(toy, layout, campaign.Slots(self.root / "slots", 1), args)
+        printed = runner.run_once(toy, layout, campaign.Slots(self.root / "slots", 1), args, NO_LIMITS)
         self.assertEqual(printed, {"in_progress": True, "spec_hash": digest, "replicate": 0})
         self.assertFalse(layout.runs_dir.exists(), "nothing ran")
 
@@ -895,7 +896,7 @@ class TestReviewFixes(_ScratchDirTest):
         )
         outcome = {}
         worker = threading.Thread(daemon=True, target=lambda: outcome.update(result=runner.launch_runs(
-            layout, [[str(self.root)]], 1, 0, [], self.root / "child.log",
+            layout, [[str(self.root)]], 1, 0, [], self.root / "child.log", lambda: None,
             program=(sys.executable, "-c", script),
         )))
         worker.start()
@@ -909,9 +910,9 @@ class TestReviewFixes(_ScratchDirTest):
         campaigns = self.root / "campaigns"
         demo = _make_campaign(campaigns, "demo", {"adapter": "toy"})
         layout = campaign.resolve_layout(demo, {})
-        parser = run.build_parser(toy, "demo")
+        parser = runner.build_parser(toy, "demo")
         planned = [batch.PlannedRun("s", {"problem": "sphere", "maxiter": 50}, 0)]
-        argvs, _, errors = runner.check_planned(toy, layout, parser, planned, "demo", "b1", runner._IdentityCache(toy))
+        argvs, _, errors = runner.check_planned(toy, layout, parser, planned, "demo", "b1", runner._IdentityCache(toy), NO_LIMITS)
         self.assertEqual(errors, [])
         args = runner.with_seed(toy, parser.parse_args(argvs[0]))
         digest = runner.spec_hash(toy, runner.run_spec(args), toy.solver_identity(args))
@@ -921,10 +922,10 @@ class TestReviewFixes(_ScratchDirTest):
                    campaign.MAX_PARALLEL_ENV: "2"}
         original_env, original_delay = dict(os.environ), runner.IN_PROGRESS_RETRY_SECONDS
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original_env)))
-        self.addCleanup(setattr, run, "IN_PROGRESS_RETRY_SECONDS", original_delay)
+        self.addCleanup(setattr, runner, "IN_PROGRESS_RETRY_SECONDS", original_delay)
         os.environ.update(environ)
         runner.IN_PROGRESS_RETRY_SECONDS = 0.5
-        results, stop, failed = runner.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log")
+        results, stop, failed = runner.launch_runs(layout, argvs, 1, 0, [], self.root / "child.log", lambda: None)
         self.assertEqual(([r["status"] for r in results], stop, failed), (["pass"], None, 0))
         self.assertIn("running in another process", (self.root / "child.log").read_text(),
                       "the first attempt must have found the spec claimed")
@@ -1054,7 +1055,7 @@ class TestReviewRound2(_ScratchDirTest):
         self.addCleanup(setattr, toy, "solver_identity", original)
         toy.solver_identity = identity
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = runner.run_batch(toy, layout, run.build_parser(toy, "demo"), "demo", plan, 1, dry_run=True)
+            code = runner.run_batch(toy, layout, runner.build_parser(toy, "demo"), "demo", plan, 1, dry_run=True, limits=NO_LIMITS)
         self.assertEqual(code, 0)
         self.assertIn("confirm: top 1 of screen", out.getvalue())
 

@@ -1,6 +1,6 @@
 ---
 name: setup-harness
-description: Interactive first-time setup of the autoresearch harness for the user's own optimizer (any program that runs from a command). Finds their solver and its interpreter, installs missing dependencies, generates a solver adapter + campaign folder (config, program file, lessons), and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to regenerate the program file for a new campaign.
+description: Interactive setup of the autoresearch harness for the user's own optimizer (any program that runs from a command). Finds their solver and its interpreter, installs missing dependencies, generates a solver adapter + campaign folder (config with constraints and budget, program file, lessons), and ends with a real run. Use when a collaborator clones this repo, when wiring the harness to a new solver, or to start a new campaign for an already-installed adapter.
 ---
 
 # setup-harness
@@ -14,9 +14,26 @@ wire it to their solver and prove it runs.
 The end state is these pieces, all verified by a real run:
 **adapter** (`adapters/<solver>.py`, the solver-specific glue) + **campaign
 folder** `campaigns/<slug>/` holding `config.json` (which adapter + its
-settings), `program.md` (the agent's instructions) and `LESSONS.md` (research
-memory) + **run.py** (generic runner, untouched) + the campaign's
-**results.db** (experiment DB, created by the first run).
+settings, parameter constraints, budget), `program.md` (~30 lines: mission,
+goals and stopping criteria, rules no code can check) and `LESSONS.md`
+(campaign memory) + **solver lessons** `lessons/<adapter>.md` (shared by every
+campaign on that adapter) + **run.py** (generic runner, untouched) + the
+campaign's **results.db** (experiment DB, created by the first run). The
+research method itself lives once in `.claude/skills/research/SKILL.md`; the
+user then runs `/research <slug>` and never writes a system prompt.
+
+**Two paths.** Ask first whether this is a new solver or a new campaign for
+an adapter already registered in `adapters/__init__.py` (list them, and the
+existing campaigns from `python run.py status`).
+- **New solver** — run every phase.
+- **New campaign for an existing adapter** — skip Phases 2–4, Phase 5's
+  hardware questions 1–2, device probe and threads/timeout questions, and
+  Phase 6 steps 1 and 3 (adapter and machine settings already exist). Take
+  `env` from an existing campaign on that adapter (show it and confirm), then
+  ask Phase 5's campaign questions (mission, goals, limits, budget, autonomy,
+  planning interval, how it shares the machine; metric goals belong to the
+  adapter and are not asked again), do Phase 6 steps 2, 4, 5 and 6, a smoke
+  run (Phase 7 step 1) and Phase 8.
 
 Run the phases in order. Be concrete, verify every step, and do not declare
 done on a red smoke run. The user may be new to autoresearch and skeptical that
@@ -31,7 +48,7 @@ Read these before asking anything:
    including the `RunContext` / `ExperimentOutcome` types it uses.
 2. `README.md` — how the generic core works: campaign selection
    (`--campaign`, one folder per campaign under `campaigns/`), `config.json`
-   (`adapter` + `env`), how it calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
+   (`adapter`, `env`, `fixed` / `bounds` / `budget`), how it calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
    hash / dedupe / derived seeds / replay, the artifact layout
    (`AUTORESEARCH_SCRATCH_DIR` / `AUTORESEARCH_KEEP_ARTIFACTS` /
    `AUTORESEARCH_ARTIFACTS_DIR`). Metrics are stored as JSON; the
@@ -42,6 +59,8 @@ Read these before asking anything:
    example of the contract. You will model the generated adapter on this.
 4. `templates/program_template.md` and `templates/LESSONS.md` — the skeletons
    you fill or copy into the campaign folder later.
+5. `.claude/skills/research/SKILL.md` — the shared research method the
+   campaign will run under; do not repeat any of it in `program.md`.
 
 Do not read or write dotenv files; adapter settings go in the campaign's
 `config.json` `"env"` map (a variable set in the shell overrides it).
@@ -108,18 +127,33 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 - **Campaign title** + 2–5 sentence **mission**, and a short **slug** for the
   campaign folder (`campaigns/<slug>/`). If campaigns already exist, confirm
   this is a new goal rather than more runs for an existing campaign.
-- **Success metric**: the one measurable claim that defines success, and how it
-  is verified.
+- **Goals and stopping criteria**: the one measurable claim that defines
+  success and how it is verified, how to rank conflicting goals, and when the
+  agent should stop (criteria met, a plateau, …).
 - **Metric goals**: for each metric the solver reports, should it go down,
   up, or is it only recorded? These become the adapter's `METRICS` and decide
   which runs `run.py brief` shows on the Pareto front. Keep the goal set to
   what the user actually optimizes; constraints are not goals.
-- **Hard invariants**: hardware limits, sign/convention contracts, ceilings.
-  Offer "none yet" as valid. Remind: every entry removes agent freedom — keep to
-  real physical/hardware limits.
-- **Constraint floors**: the buildability limits (offer the adapter's defaults
-  as baseline).
-- **Hardware and run budget.** First run `python run.py status` and show the
+- **Limits**: hardware limits, buildability floors, resolution ceilings,
+  sign/convention contracts. Offer "none yet" as valid. Remind: every entry
+  removes agent freedom — keep to real physical/hardware limits. Sort each
+  limit by whether code can check it:
+  - a parameter that must take one value → `config.json` `fixed`
+    (`{"<dest>": value}`);
+  - a numeric parameter range → `bounds` (`{"<dest>": [min, max]}`,
+    inclusive);
+  - anything else (conventions, judgment, limits on outputs rather than
+    inputs) → a hard rule in `program.md`.
+  Keys are the adapter's parameter dests as used in batch specs
+  (`python run.py --campaign <slug> --help`, dashes → underscores), never
+  core flags or the adapter's `EXECUTION_FLAGS`; `run.py` rejects unknown
+  keys and malformed values when it loads the config.
+- **Budget**: the campaign's total runs and/or hours (sum of recorded run
+  time) → `config.json` `budget` (`{"runs": N, "hours": H}`, either optional).
+  It counts every run record of the campaign, all statuses, across sessions;
+  `run.py` refuses runs and batches beyond it. To extend a campaign, the user
+  raises it.
+- **Hardware.** First run `python run.py status` and show the
   user what it detected (OS, usable CPUs, performance cores on Apple Silicon,
   memory, GPUs, SLURM). Fill gaps with OS-native commands only when needed
   (Windows: PowerShell `Get-CimInstance Win32_ComputerSystem`; AMD:
@@ -131,8 +165,6 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      headroom on a shared box / a fixed number of cores and GB.
   3. **How often should the agent look at results and plan the next batch?**
      e.g. every 30 min / 2 h / overnight. Becomes `plan_minutes`.
-  4. **Session budget?** hours or runs before the loop stops. Goes into the
-     program file's autonomy policy.
   If other campaigns already exist (`python run.py status` lists them), also ask
   **how this campaign shares the machine** — becomes its `max_parallel` cap.
   Also ask the solver's threads per run and timeout per mode.
@@ -146,7 +178,9 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   `XLA_CLIENT_MEM_FRACTION`) in the campaign's `env`, since JAX takes 75% of
   GPU memory at its first operation. On Apple Silicon the GPU shares RAM
   with the CPU: one memory budget, not two.
-- **Autonomy**: "never stop" loop vs bounded sessions.
+- **Autonomy**: "never stop" until the budget or the goals end it, or bounded
+  sessions (e.g. N runs per session, then report) — goes into `program.md`'s
+  stopping criteria.
 - **Artifact layout**: `AUTORESEARCH_SCRATCH_DIR` (scratch, default
   `campaigns/<slug>/scratch`), `AUTORESEARCH_KEEP_ARTIFACTS`
   (`none`/`pass`/`all` — whole run dirs; the adapter's evidence files are
@@ -172,33 +206,41 @@ freedom; physics findings belong in `LESSONS.md`, not here.
      `REGISTRY` entry. Do **not** edit `adapter.py`, `run.py` or any other
      core module.
 2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...},
-   "plan_minutes": P, "max_parallel": N}` from the interview: the adapter's
+   "plan_minutes": P, "max_parallel": N, "fixed": {...}, "bounds": {...},
+   "budget": {"runs": R, "hours": H}}` from the interview: the adapter's
    `REGISTRY` key; in `env` the solver root, interpreter, config dir, device
    settings (e.g. the JAX memory variables) and any non-default
    artifact-layout values; `plan_minutes` from question 3; `max_parallel`
-   only when the machine is shared between campaigns. Omit anything left at
-   default. No shell exports are needed.
+   only when the machine is shared between campaigns; `fixed` / `bounds` /
+   `budget` from the limits and budget answers. Omit anything left at
+   default or unconstrained. No shell exports are needed. Check it loads:
+   `python run.py brief --campaign <slug>` shows the constraints and budget.
 3. **Machine settings** — `python run.py status --usable-cores C
    --usable-memory-gb M --max-parallel N` from question 2. Start
    `--max-parallel` at `usable cores ÷ threads per run`; Phase 7 refines it
    with measured memory. These are machine-wide (`~/.autoresearch/machine.json`),
    shared by every campaign.
 4. **`campaigns/<slug>/program.md`** — fill every `{{PLACEHOLDER}}` in
-   `templates/program_template.md` from the interview + introspection:
-   parameter table (only real flags), target-configuration table, artifact
-   layout, success metric, hard invariants, constraint floors, schema
-   (`python run.py query --campaign <slug> "PRAGMA table_info(results)"`) and
-   metric goals (the adapter's `METRICS`), machine policy
-   (slots, planning interval, budget). Leave deferred
-   sections as short "TODO — fill in as lessons accumulate" notes; do not invent
+   `templates/program_template.md` from the interview: title, slug, mission,
+   goals and stopping criteria, hard rules (only the ones code cannot
+   check). Keep it near 30 lines. Parameters, modes, schema, machine numbers
+   and the research loop are not copied in — the agent reads them live
+   (`--help`, `brief`, `status`) and from the `/research` skill. Do not invent
    physics. Remove all template HTML comments from the generated file.
 5. **`campaigns/<slug>/LESSONS.md`** — copy `templates/LESSONS.md`. Never
    overwrite an existing campaign's `LESSONS.md`.
+6. **`lessons/<adapter>.md`** (repo root; `<adapter>` is the adapter's
+   `NAME`) — if missing, copy `templates/LESSONS.md` with the title
+   `# Solver lessons — <adapter>`. Never overwrite an existing one: it holds
+   lessons from every campaign on that solver.
 
 ## Phase 7 — Verify (must end green)
 
 1. Run one tiny experiment with `python run.py --campaign <slug> ...` and the
-   smallest meaningful settings (low iterations/resolution, short timeout).
+   smallest meaningful settings (low iterations/resolution, short timeout)
+   that respect the campaign's `fixed` / `bounds` (a violating run is refused
+   — that refusal is also a check that the constraints load). Smoke runs
+   count toward the budget.
    Expect a single JSON line with a `"status"`, a record in
    `campaigns/<slug>/runs/`, and a row in `campaigns/<slug>/results.db`. Then
    run `python run.py replay <run-id> --campaign <slug>` and confirm it matches.
@@ -220,17 +262,20 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 ## Phase 8 — Report & how to run
 
 Print a short, practical summary:
-- The adapter written (`adapters/<slug>.py`) and the campaign folder
-  (`campaigns/<slug>/`: `config.json`, `program.md`, `LESSONS.md`).
+- The adapter written (`adapters/<slug>.py`), the campaign folder
+  (`campaigns/<slug>/`: `config.json`, `program.md`, `LESSONS.md`) and the
+  solver lessons file (`lessons/<adapter>.md`, new or existing).
+- The active constraints (`fixed`, `bounds`) and budget.
 - Any adapter↔solver flag drift found and how it was resolved.
 - The machine budget: run slots, runs that fit at once per mode, the
   suggested batch size per planning interval, and which devices passed the
   probe.
 - **The first real launch command**, e.g.
   `python run.py --campaign <slug> --mode <mode> --<target-flag> <case> [params]`.
-- **How to start the loop**: "Read `campaigns/<slug>/program.md`, then start
-  the optimization loop."
-- Reminders: `LESSONS.md` is append-only memory; the program file is the
-  contract; query results with `sqlite3 campaigns/<slug>/results.db`; re-run
-  `/setup-harness` for a new campaign or solver (it creates a new campaign
-  folder / adapter rather than overwriting).
+- **How to start the loop**: `/research <slug>` (it also resumes a stopped
+  campaign).
+- Reminders: lesson files are append-only memory; `program.md` holds the
+  goals, `config.json` the enforced limits; query results with
+  `python run.py query --campaign <slug> "SQL"`; re-run `/setup-harness` for a
+  new campaign or solver (it creates a new campaign folder / adapter rather
+  than overwriting).

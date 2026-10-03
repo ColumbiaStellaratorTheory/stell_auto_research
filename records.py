@@ -23,7 +23,7 @@ from types import ModuleType
 from typing import Mapping
 
 import analysis
-from campaign import HarnessError, Layout
+from campaign import HarnessError, Layout, Usage
 from contract import sha256_file
 from locks import acquire, release
 
@@ -265,6 +265,15 @@ def find_duplicate(layout: Layout, active: ModuleType, digest: str, replicate: i
             (digest, replicate, *DEDUPE_STATUSES),
         ).fetchone()
     return dict(row) if row else None
+
+
+def usage(layout: Layout, active: ModuleType) -> Usage:
+    """The campaign's budget use: run records indexed in results.db and their summed elapsed seconds."""
+    if not layout.db_path.exists():
+        return Usage(0, 0.0)
+    with contextlib.closing(open_db(layout, active)) as db:
+        runs, seconds = db.execute("SELECT COUNT(*), COALESCE(SUM(elapsed), 0) FROM runs").fetchone()
+    return Usage(runs, float(seconds))
 
 
 def index_record(layout: Layout, active: ModuleType, record: Mapping[str, object]) -> None:

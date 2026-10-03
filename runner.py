@@ -2,10 +2,11 @@
 
 The harness core is solver-agnostic: the campaign's solver adapter (named in
 its config.json; see adapter.py / contract.py) runs the solver, and this
-module turns each run into a record (records.py). It owns the spec hash, the
-derived seed, dedupe via per-spec claims, the machine's run slots, the
-scratch/artifact lifecycle, replay, batch execution (planning is batch.py),
-and the `brief` and `status` text.
+module turns each run into a record (records.py). It owns the run's argument
+parser, the spec hash, the derived seed, the campaign's limits (config.json
+`fixed`, `bounds`, `budget`), dedupe via per-spec claims, the machine's run
+slots, the scratch/artifact lifecycle, replay, batch execution (planning is
+batch.py), and the `brief` and `status` text.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Mapping
+from typing import Callable, Mapping
 
 import analysis
 import batch
@@ -36,15 +37,15 @@ import machine
 import records
 from adapter import AdapterError, load_adapter
 from campaign import (
-    DB_NAME, REPO_ROOT, CampaignConfig, HarnessError, Layout, Slots, busy_slots, list_campaigns,
-    load_config, machine_dir, resolve_slots,
+    CAMPAIGN_ENV, CONFIG_NAME, CORE_FLAGS, DB_NAME, REPO_ROOT, Budget, CampaignConfig, CampaignError, HarnessError,
+    Layout, Slots, Usage, busy_slots, list_campaigns, load_config, machine_dir, resolve_slots,
 )
 from contract import Cancelled, ExperimentOutcome, RunContext, clean, git_output, sha256_file
 from locks import acquire_slot, release, report_waiting, try_lock
 
-# Core flags that select how the harness runs, not what the solver computes.
-CORE_FLAGS = ("campaign", "replicate", "batch_id", "parent_run_id")
 LESSONS_NAME = "LESSONS.md"
+# Solver lessons, shared by every campaign of an adapter: <dir>/<adapter NAME>.md.
+SOLVER_LESSONS_DIR = REPO_ROOT / "lessons"
 LOG_TAIL_BYTES = 64 * 1024
 BATCH_POLL_SECONDS = 0.2
 # A spec another process is running right now is retried after this delay;
@@ -72,8 +73,32 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Run specification: spec, seed, spec hash
+# Run specification: parser, spec, seed, spec hash
 # ---------------------------------------------------------------------------
+
+def build_parser(active: ModuleType, campaign: str | None) -> argparse.ArgumentParser:
+    """The parser of one run: the core flags, --mode, and every flag the adapter registers."""
+    p = argparse.ArgumentParser(description="Run one optimization experiment")
+    p.add_argument(
+        "--campaign",
+        default=campaign,
+        help=f"campaign under campaigns/ (default: ${CAMPAIGN_ENV}, or the only campaign)",
+    )
+    p.add_argument(
+        "--replicate", type=int, default=0,
+        help="sample index of this spec; a new index draws a new derived seed (default 0)",
+    )
+    p.add_argument("--batch-id", default=None, help="set by `run.py batch`: the batch this run belongs to")
+    p.add_argument("--parent-run-id", default=None, help="the run this one builds on (set by batch promotion)")
+    p.add_argument(
+        "--mode",
+        choices=list(active.MODES),
+        default=active.MODES[0],
+        help="mode exposed by the campaign's adapter",
+    )
+    active.add_arguments(p)
+    return p
+
 
 def run_spec(args: argparse.Namespace) -> dict:
     """Every parsed CLI value except core flags, NaN-cleaned.
@@ -122,6 +147,107 @@ def spec_hash(active: ModuleType, spec: Mapping[str, object], solver_identity: s
     return _canonical_hash(
         {"adapter": active.NAME, "spec": _hashed_fields(active, spec), "solver": solver_identity}
     )
+
+
+# ---------------------------------------------------------------------------
+# Campaign limits: config.json fixed, bounds, budget
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Limits:
+    """What config.json allows a new run: `fixed` values, inclusive `bounds`, and the `budget`.
+
+    `fixed` holds the values as the adapter's flags parse them, so they compare
+    equal to a run's parsed arguments. Replay is exempt (it re-checks a record).
+    """
+
+    fixed: Mapping[str, object]
+    bounds: Mapping[str, tuple[float, float]]
+    budget: Budget
+
+    def violations(self, args: argparse.Namespace, skip: tuple[str, ...] = ()) -> list[str]:
+        """Each way `args` breaks `fixed` or `bounds` (params in `skip` are not checked)."""
+        found = [
+            f"{key}={analysis.fmt(getattr(args, key))}, fixed at {analysis.fmt(want)}"
+            for key, want in self.fixed.items()
+            if key not in skip and getattr(args, key) != want
+        ]
+        for key, (lo, hi) in self.bounds.items():
+            value = getattr(args, key)
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if key not in skip and not (numeric and lo <= value <= hi):
+                found.append(f"{key}={analysis.fmt(value)} outside bounds [{analysis.fmt(lo)}, {analysis.fmt(hi)}]")
+        return found
+
+    def describe(self) -> str:
+        parts = []
+        if self.fixed:
+            parts.append("fixed " + ", ".join(f"{k}={analysis.fmt(v)}" for k, v in self.fixed.items()))
+        if self.bounds:
+            parts.append("bounds " + ", ".join(
+                f"{k} in [{analysis.fmt(lo)}, {analysis.fmt(hi)}]" for k, (lo, hi) in self.bounds.items()
+            ))
+        return " · ".join(parts) or "none"
+
+
+def _param_problem(active: ModuleType, defaults: Mapping[str, object], key: str) -> str | None:
+    """Why `key` cannot be constrained, or None when it is a solver parameter of the run spec."""
+    if key in CORE_FLAGS:
+        return "is set by the harness, not a solver parameter"
+    if key in active.EXECUTION_FLAGS:
+        return "is an execution flag: it changes how a run executes, not what it computes"
+    if key not in defaults:
+        known = sorted(k for k in defaults if k not in CORE_FLAGS and k not in active.EXECUTION_FLAGS)
+        return f"is not a parameter of adapter '{active.NAME}' (parameters: {', '.join(known)})"
+    return None
+
+
+def resolve_limits(
+    active: ModuleType, parser: argparse.ArgumentParser, config: CampaignConfig, campaign_dir: Path,
+) -> Limits:
+    """config.json's fixed / bounds checked against the adapter's parameters; CampaignError names the key.
+
+    Keys must be run-spec params (argparse dests, as in batch specs), not core
+    or execution flags. A fixed value is parsed by its flag the way a batch
+    spec value is; a bounded param must not be a string or boolean flag.
+    """
+    path = campaign_dir / CONFIG_NAME
+    defaults = vars(parser.parse_args([]))
+    for section, keys in (("fixed", config.fixed), ("bounds", config.bounds)):
+        for key in keys:
+            problem = _param_problem(active, defaults, key)
+            if problem:
+                raise CampaignError(f"{path}: \"{section}\" key '{key}' {problem}")
+    fixed = {}
+    for key, value in config.fixed.items():
+        parsed = _parse_planned(parser, [_flag(key), str(value)])
+        if isinstance(parsed, str):
+            raise CampaignError(f"{path}: \"fixed\" value for '{key}' is invalid: {parsed}")
+        fixed[key] = getattr(parsed, key)
+    for key in config.bounds:
+        if isinstance(defaults[key], (str, bool)):
+            raise CampaignError(
+                f"{path}: \"bounds\" key '{key}' is not numeric (default {defaults[key]!r}); use \"fixed\""
+            )
+    return Limits(fixed, dict(config.bounds), config.budget)
+
+
+def _budget_spent(active: ModuleType, layout: Layout, budget: Budget) -> str | None:
+    """Why the campaign's budget allows no new run, or None (no DB query without a budget)."""
+    return budget.exhausted(records.usage(layout, active)) if budget.limited else None
+
+
+def limit_lines(limits: Limits, used: Usage) -> list[str]:
+    """The constraints and budget lines of `brief` and `status`."""
+    budget = limits.budget
+    runs = f"{used.runs} runs"
+    hours = f"{used.hours:.2f} h"
+    if budget.runs is not None:
+        runs = f"{used.runs} of {budget.runs} runs used ({budget.runs_left(used)} left)"
+    if budget.hours is not None:
+        hours = f"{used.hours:.2f} of {budget.hours:g} h used ({max(0.0, budget.hours - used.hours):.2f} h left)"
+    spent = f"budget: {runs} · {hours}" if budget.limited else f"budget: none · {runs}, {hours} recorded"
+    return [f"constraints: {limits.describe()}", spent]
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +417,20 @@ def execute(
     return record
 
 
-def run_once(active: ModuleType, layout: Layout, slots: Slots, args: argparse.Namespace) -> dict:
+def run_once(active: ModuleType, layout: Layout, slots: Slots, args: argparse.Namespace, limits: Limits) -> dict:
     """Run the experiment unless it is already recorded or running; return the stdout object.
 
-    Order: claim the spec (so concurrent agents never run it twice), check for
-    an earlier pass/fail run, then wait for a machine-wide slot and execute.
+    Order: refuse a spec that breaks the campaign's fixed / bounds, claim the
+    spec (so concurrent agents never run it twice), check for an earlier
+    pass/fail run, refuse when the budget is spent, then wait for a
+    machine-wide slot and execute. A refusal raises HarnessError and records
+    nothing; an already-recorded spec is answered whatever the budget.
     """
+    violations = limits.violations(args)
+    if violations:
+        raise HarnessError(
+            f"run refused, it breaks {layout.campaign_dir / CONFIG_NAME}: {'; '.join(violations)}"
+        )
     identity = active.solver_identity(args)
     digest = spec_hash(active, run_spec(args), identity)
     claim = try_lock(layout.claims_dir / f"{digest}-{args.replicate}.lock")
@@ -312,6 +446,9 @@ def run_once(active: ModuleType, layout: Layout, slots: Slots, args: argparse.Na
             )
             return {"duplicate_of": duplicate["id"], "status": duplicate["status"],
                     "status_reason": duplicate["status_reason"], "replicate": args.replicate}
+        spent = _budget_spent(active, layout, limits.budget)
+        if spent:
+            raise HarnessError(f"run refused, {spent} (\"budget\" in {layout.campaign_dir / CONFIG_NAME})")
         slot = acquire_slot(slots.dir, slots.capacity, report_waiting(slots.capacity))
         try:
             record = execute(active, layout, args, identity)
@@ -412,9 +549,9 @@ def replay(
 # Brief and status
 # ---------------------------------------------------------------------------
 
-def read_lessons(campaign_dir: Path) -> str:
-    path = campaign_dir / LESSONS_NAME
-    return path.read_text() if path.exists() else ""
+def lesson_titles(path: Path) -> list[str] | None:
+    """Titles of the lesson entries in `path`, oldest first; None when the file does not exist."""
+    return analysis.lesson_titles(path.read_text()) if path.exists() else None
 
 
 def capacity_lines(
@@ -441,7 +578,9 @@ def capacity_lines(
     return lines
 
 
-def brief(active: ModuleType, layout: Layout, config: CampaignConfig, environ: Mapping[str, str]) -> str:
+def brief(
+    active: ModuleType, layout: Layout, config: CampaignConfig, limits: Limits, environ: Mapping[str, str],
+) -> str:
     views = load_views(layout, active)
     slots = resolve_slots(environ)
     machine_lines = [f"machine: {slots.capacity} run slots, {busy_slots(slots)} busy",
@@ -451,7 +590,9 @@ def brief(active: ModuleType, layout: Layout, config: CampaignConfig, environ: M
         active.NAME,
         views,
         active.METRICS,
-        analysis.lesson_titles(read_lessons(layout.campaign_dir)),
+        lesson_titles(layout.campaign_dir / LESSONS_NAME) or [],
+        lesson_titles(SOLVER_LESSONS_DIR / f"{active.NAME}.md"),
+        limit_lines(limits, Usage.of(views)),
         machine_lines,
     )
 
@@ -462,6 +603,7 @@ def campaign_status(campaign_dir: Path, environ: Mapping[str, str]) -> list[str]
     try:
         config = load_config(campaign_dir)
         active = load_adapter(config.adapter)
+        limits = resolve_limits(active, build_parser(active, name), config, campaign_dir)
     except (HarnessError, AdapterError) as e:
         return [f"campaign {name}: {e}"]
     plan = f" · plans every {config.plan_minutes:g} min" if config.plan_minutes else ""
@@ -469,8 +611,9 @@ def campaign_status(campaign_dir: Path, environ: Mapping[str, str]) -> list[str]
     runs = records.load_runs_readonly(campaign_dir / DB_NAME)
     if runs is None:
         return [head, f"  results.db needs `python run.py rebuild --campaign {name}`"]
+    limit_text = [f"  {line}" for line in limit_lines(limits, Usage.of(runs))]
     if not runs:
-        return [head, "  no runs yet"]
+        return [head, "  no runs yet", *limit_text]
     views = _views(active, runs)
     counts = Counter(v["status"] for v in views)
     last = max(v["created_at"] for v in views)[:19]
@@ -480,6 +623,7 @@ def campaign_status(campaign_dir: Path, environ: Mapping[str, str]) -> list[str]
         head,
         f"  {len(views)} runs: {counts['pass']} pass, {counts['fail']} fail, {counts['crash']} crash"
         f" · last {last} · {front}",
+        *limit_text,
         *capacity_lines(active, views, config, environ),
     ]
 
@@ -545,13 +689,14 @@ class _IdentityCache:
 
 def check_planned(
     active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, planned: list[batch.PlannedRun],
-    campaign: str, batch_id: str, identity: _IdentityCache,
+    campaign: str, batch_id: str, identity: _IdentityCache, limits: Limits,
 ) -> tuple[list[list[str]], int, list[str]]:
     """(argv per distinct run, how many of them are already recorded, errors), running nothing.
 
-    Planned runs that resolve to the same (spec hash, replicate) are launched
-    once. Already-recorded ones are still launched: their child answers
-    `duplicate_of` at once, which gives later stages their results.
+    A run that does not parse or breaks the campaign's fixed / bounds is an
+    error. Planned runs that resolve to the same (spec hash, replicate) are
+    launched once. Already-recorded ones are still launched: their child
+    answers `duplicate_of` at once, which gives later stages their results.
     """
     argvs, recorded, errors, seen = [], 0, [], set()
     for i, run_plan in enumerate(planned):
@@ -561,6 +706,10 @@ def check_planned(
             errors.append(f"{run_plan.stage} run {i} {dict(run_plan.spec)}: {parsed}")
             continue
         args = with_seed(active, parsed)
+        violations = limits.violations(args)
+        if violations:
+            errors.append(f"{run_plan.stage} run {i} {dict(run_plan.spec)}: {'; '.join(violations)}")
+            continue
         digest = spec_hash(active, run_spec(args), identity(args))
         key = (digest, args.replicate)
         if key in seen:
@@ -589,7 +738,7 @@ def _child_result(proc: subprocess.Popen, stdout) -> dict:
 
 def launch_runs(
     layout: Layout, argvs: list[list[str]], parallel: int, same_crash: int,
-    completed: list[dict], log: Path,
+    completed: list[dict], log: Path, budget_spent: Callable[[], str | None],
     program: tuple[str, ...] = (sys.executable, str(REPO_ROOT / "run.py")),
 ) -> tuple[list[dict], str | None, int]:
     """Run each argv as its own `program` process (default: run.py), `parallel` at a time.
@@ -597,10 +746,12 @@ def launch_runs(
     Children print to a temporary file, never a pipe, so a large result cannot
     block them. A child that finds its spec running elsewhere (`in_progress`)
     is retried after IN_PROGRESS_RETRY_SECONDS. Launching stops (in-flight
-    runs finish) once the early-stop rule fires. Returns (result views of this
-    call's runs, stop reason or None, number of children that exited without
-    a result — their stderr is in `log`). On cancellation, children are sent
-    SIGTERM so each records itself as cancelled.
+    runs finish) once the early-stop rule fires, or once `budget_spent` —
+    asked after each child that did not reuse a recorded run — gives a
+    reason. Returns (result views of this call's runs, stop reason or None,
+    number of children that exited without a result — their stderr is in
+    `log`). On cancellation, children are sent SIGTERM so each records itself
+    as cancelled.
     """
     queue = [(0.0, argv) for argv in argvs]  # (not before, argv)
     running: list[tuple[subprocess.Popen, object, list[str]]] = []
@@ -631,12 +782,15 @@ def launch_runs(
                     run_id = printed.get("id") or printed.get("duplicate_of")
                     if run_id is None:
                         failed += 1
+                        stop = stop or budget_spent()
                         continue
                     record = records.read_run_record(layout.runs_dir, run_id)
                     view = {**_result_view(record), "reused": "duplicate_of" in printed}
                     results.append(view)
                     completed.append(view)
                     stop = stop or batch.should_stop(completed, same_crash)
+                    if not view["reused"]:
+                        stop = stop or budget_spent()
         except BaseException:
             for proc, _, _ in running:
                 proc.terminate()
@@ -665,21 +819,42 @@ def _summary_lines(stage: str, results: list[dict], metric_goals: Mapping[str, s
     return lines
 
 
+def _batch_budget_problem(budget: Budget, used: Usage, new_runs: int) -> str | None:
+    """Why a batch planning at most `new_runs` new runs does not fit the remaining budget, or None."""
+    if new_runs == 0:
+        return None
+    spent = budget.exhausted(used)
+    if spent:
+        return f"{spent}; this batch plans up to {new_runs} new runs"
+    left = budget.runs_left(used)
+    if left is not None and new_runs > left:
+        return f"this batch plans up to {new_runs} new runs, but {left} of the {budget.runs}-run budget remain"
+    return None
+
+
 def run_batch(
     active: ModuleType, layout: Layout, parser: argparse.ArgumentParser, campaign: str,
-    path: Path, parallel: int, dry_run: bool,
+    path: Path, parallel: int, dry_run: bool, limits: Limits,
 ) -> int:
-    """Validate a batch file, then run its stages in order; print a capped summary."""
+    """Validate a batch file against the campaign's limits, then run its stages in order; print a capped summary.
+
+    Every planned run is checked against fixed / bounds up front, and the
+    batch's new runs (promotion stages counted at their most: top ×
+    replicates) against the remaining run budget; any problem refuses the
+    whole batch. While it runs, launching stops once the budget is spent.
+    """
     plan = batch.load_batch(path, active.METRICS)
     identity = _IdentityCache(active)
     dests = set(vars(parser.parse_args([])))
     errors, previews = [], []
+    new_runs = promoted = 0
     for stage in plan.stages:
         if stage.source is None:
             argvs, recorded, stage_errors = check_planned(
-                active, layout, parser, batch.plan_stage(stage), campaign, "check", identity
+                active, layout, parser, batch.plan_stage(stage), campaign, "check", identity, limits
             )
             errors += stage_errors
+            new_runs += len(argvs) - recorded
             previews.append(f"{stage.name}: {len(argvs) - recorded} to run, {recorded} already recorded")
         else:
             unknown = sorted(k for k in [*stage.base, *stage.carry] if k not in dests)
@@ -693,13 +868,27 @@ def run_batch(
                 )
                 if isinstance(parsed, str):
                     errors.append(f"{stage.name} base {dict(stage.base)}: {parsed}")
+                else:
+                    # Carried params come from earlier runs of this batch, checked when they were planned.
+                    violations = limits.violations(with_seed(active, parsed), skip=tuple(stage.carry))
+                    if violations:
+                        errors.append(f"{stage.name} base {dict(stage.base)}: {'; '.join(violations)}")
+            promoted += stage.top * stage.replicates
             previews.append(
                 f"{stage.name}: top {stage.top} of {stage.source} by {stage.rank_by} × {stage.replicates} replicates"
             )
+    used = records.usage(layout, active)
+    over_budget = _batch_budget_problem(limits.budget, used, new_runs + promoted)
+    if over_budget:
+        errors.append(over_budget)
     if errors:
-        raise HarnessError("batch has invalid runs; nothing was launched:\n" + "\n".join(f"- {e}" for e in errors))
+        raise HarnessError("batch refused; nothing was launched:\n" + "\n".join(f"- {e}" for e in errors))
     if dry_run:
-        print(f"batch {path} (valid) · parallel {parallel}\n" + "\n".join(previews))
+        planned = f"this batch: {new_runs} new runs" + (f" + up to {promoted} promoted" if promoted else "")
+        print("\n".join([
+            f"batch {path} (valid) · parallel {parallel}", *previews,
+            *limit_lines(limits, used), planned,
+        ]))
         return 0
 
     batch_id = _uuid7()
@@ -728,11 +917,16 @@ def run_batch(
                 selected = batch.select_runs(stage, results_by_stage.get(stage.source, []), active.METRICS)
                 params = {r["id"]: records.read_run_record(layout.runs_dir, r["id"])["params"] for r in selected}
                 planned = batch.plan_promotion(stage, selected, params)
-            argvs, _, stage_errors = check_planned(active, layout, parser, planned, campaign, batch_id, identity)
+            argvs, _, stage_errors = check_planned(
+                active, layout, parser, planned, campaign, batch_id, identity, limits
+            )
             if stage_errors:
                 failure = f"{stage.name}: invalid promoted runs: {stage_errors[0]}"
                 break
-            results, stop, failed = launch_runs(layout, argvs, parallel, plan.same_crash_stop, completed, log)
+            results, stop, failed = launch_runs(
+                layout, argvs, parallel, plan.same_crash_stop, completed, log,
+                lambda: _budget_spent(active, layout, limits.budget),
+            )
             results_by_stage[stage.name] = results
             batch_record["stages"][stage.name] = [r["id"] for r in results]
             lines += _summary_lines(stage.name, results, active.METRICS)

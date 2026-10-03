@@ -1,18 +1,19 @@
 """Which campaign a command acts on, how it is configured, and where its files live.
 
-Covers campaign selection, config.json, the campaign's directory layout, and
-the machine-wide run slots. Every environment variable the harness itself
-reads is named here.
+Covers campaign selection, config.json (including its run budget), the
+campaign's directory layout, and the machine-wide run slots. Every environment
+variable the harness itself reads, and every flag the harness sets on a run, is
+named here.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Mapping, MutableMapping
+from typing import Mapping, MutableMapping, Sequence
 
 import machine
 from locks import release, try_lock
@@ -21,6 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_NAME = "config.json"
 DB_NAME = "results.db"
 KEEP_ARTIFACTS_CHOICES = ("none", "pass", "all")
+# Flags the harness sets on every run (argparse dests): they select how it is
+# run and recorded, not what the solver computes, so they are never part of the
+# run spec, a batch file, or config.json `fixed` / `bounds`.
+CORE_FLAGS = ("campaign", "replicate", "batch_id", "parent_run_id")
+BUDGET_KEYS = ("runs", "hours")
+SECONDS_PER_HOUR = 3600
 
 CAMPAIGN_ENV = "AUTORESEARCH_CAMPAIGN"
 CAMPAIGNS_DIR_ENV = "AUTORESEARCH_CAMPAIGNS_DIR"
@@ -44,21 +51,67 @@ class CampaignError(HarnessError):
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class Usage:
+    """What a campaign has spent: its run records (all statuses) and their recorded elapsed seconds."""
+
+    runs: int
+    seconds: float
+
+    @classmethod
+    def of(cls, runs: Sequence[Mapping[str, object]]) -> Usage:
+        """The usage of these run rows (same count and sum as records.usage computes in SQL)."""
+        return cls(len(runs), sum(float(r["elapsed"] or 0.0) for r in runs))
+
+    @property
+    def hours(self) -> float:
+        return self.seconds / SECONDS_PER_HOUR
+
+
+@dataclass(frozen=True)
+class Budget:
+    """config.json `budget`: at most `runs` run records and `hours` of recorded run time (None: no limit)."""
+
+    runs: int | None = None
+    hours: float | None = None
+
+    @property
+    def limited(self) -> bool:
+        return self.runs is not None or self.hours is not None
+
+    def runs_left(self, used: Usage) -> int | None:
+        return None if self.runs is None else max(0, self.runs - used.runs)
+
+    def exhausted(self, used: Usage) -> str | None:
+        """Why no new run may start, or None while budget remains."""
+        if self.runs is not None and used.runs >= self.runs:
+            return f"run budget spent: {used.runs} of {self.runs} runs recorded"
+        if self.hours is not None and used.hours >= self.hours:
+            return f"hours budget spent: {used.hours:.2f} of {self.hours:g} h recorded"
+        return None
+
+
+@dataclass(frozen=True)
 class CampaignConfig:
-    """A campaign's config.json: which adapter it runs, plus default env vars.
+    """A campaign's config.json: which adapter it runs, default env vars, and its limits.
 
     `env` supplies adapter configuration (solver paths, interpreters) without
     shell-specific export syntax; a variable already set in the environment
     takes precedence over the config value. `max_parallel` caps how many of
     the machine's run slots one batch of this campaign uses at once.
     `plan_minutes` is how often the agent plans a new batch; `brief` and
-    `status` turn it into a suggested batch size.
+    `status` turn it into a suggested batch size. `fixed` (param → value every
+    run must have) and `bounds` (param → inclusive [min, max]) are checked here
+    for shape only; runner.resolve_limits checks the names against the adapter.
+    `budget` caps the campaign's runs and recorded hours.
     """
 
     adapter: str
     env: Mapping[str, str]
     max_parallel: int | None = None
     plan_minutes: float | None = None
+    fixed: Mapping[str, str | int | float] = field(default_factory=dict)
+    bounds: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+    budget: Budget = Budget()
 
 
 def campaigns_root(environ: Mapping[str, str]) -> Path:
@@ -98,6 +151,44 @@ def resolve_campaign(name: str | None, root: Path) -> Path:
     )
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _parse_fixed(path: Path, raw: object) -> dict[str, str | int | float]:
+    if not isinstance(raw, dict):
+        raise CampaignError(f"{path}: \"fixed\" must map parameter names to values")
+    for key, value in raw.items():
+        if not isinstance(value, str) and not _is_number(value):
+            raise CampaignError(f"{path}: \"fixed\" value for '{key}' must be a string or number, got {value!r}")
+    return dict(raw)
+
+
+def _parse_bounds(path: Path, raw: object) -> dict[str, tuple[float, float]]:
+    if not isinstance(raw, dict):
+        raise CampaignError(f"{path}: \"bounds\" must map parameter names to [min, max]")
+    bounds = {}
+    for key, value in raw.items():
+        if not (isinstance(value, list) and len(value) == 2 and all(map(_is_number, value)) and value[0] <= value[1]):
+            raise CampaignError(f"{path}: \"bounds\" for '{key}' must be [min, max] numbers with min <= max, got {value!r}")
+        bounds[key] = (value[0], value[1])
+    return bounds
+
+
+def _parse_budget(path: Path, raw: object) -> Budget:
+    if not isinstance(raw, dict):
+        raise CampaignError(f"{path}: \"budget\" must be an object with optional {list(BUDGET_KEYS)}")
+    unknown = sorted(set(raw) - set(BUDGET_KEYS))
+    if unknown:
+        raise CampaignError(f"{path}: \"budget\" has unknown keys {unknown}; allowed: {list(BUDGET_KEYS)}")
+    runs, hours = raw.get("runs"), raw.get("hours")
+    if runs is not None and (isinstance(runs, bool) or not isinstance(runs, int) or runs < 1):
+        raise CampaignError(f"{path}: \"budget.runs\" must be an integer >= 1, got {runs!r}")
+    if hours is not None and (not _is_number(hours) or hours <= 0):
+        raise CampaignError(f"{path}: \"budget.hours\" must be a number > 0, got {hours!r}")
+    return Budget(runs, hours)
+
+
 def load_config(campaign_dir: Path) -> CampaignConfig:
     """Parse and validate a campaign's config.json."""
     path = campaign_dir / CONFIG_NAME
@@ -121,7 +212,15 @@ def load_config(campaign_dir: Path) -> CampaignConfig:
     plan_minutes = raw.get("plan_minutes")
     if plan_minutes is not None and (isinstance(plan_minutes, bool) or not isinstance(plan_minutes, (int, float)) or plan_minutes <= 0):
         raise CampaignError(f"{path}: \"plan_minutes\" must be a number > 0")
-    return CampaignConfig(adapter=adapter_name, env=env, max_parallel=max_parallel, plan_minutes=plan_minutes)
+    fixed = _parse_fixed(path, raw.get("fixed", {}))
+    bounds = _parse_bounds(path, raw.get("bounds", {}))
+    both = sorted(set(fixed) & set(bounds))
+    if both:
+        raise CampaignError(f"{path}: {both} set in both \"fixed\" and \"bounds\"; keep one")
+    return CampaignConfig(
+        adapter=adapter_name, env=env, max_parallel=max_parallel, plan_minutes=plan_minutes,
+        fixed=fixed, bounds=bounds, budget=_parse_budget(path, raw.get("budget", {})),
+    )
 
 
 def apply_env(defaults: Mapping[str, str], environ: MutableMapping[str, str]) -> None:

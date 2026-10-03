@@ -38,13 +38,13 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import analysis
+from campaign import CORE_FLAGS
 
 DEFAULT_SAME_CRASH_STOP = 3
 _PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
 _RANGE_TAGS = ("log", "int")
 _STAGE_KEYS = {"name", "base", "runs", "grid", "halton", "lhs", "replicates", "from", "select", "carry"}
 _LESSON_KEYS = ("applies", "tests", "rejects")
-RESERVED_KEYS = ("campaign", "replicate", "batch_id", "parent_run_id")
 
 
 class BatchError(Exception):
@@ -128,7 +128,7 @@ def _scale(u: float, lo: float, hi: float, tags: Sequence[str]) -> float | int:
 # ---------------------------------------------------------------------------
 
 def _check_value(where: str, key: str, value: object, errors: list[str]) -> None:
-    if key in RESERVED_KEYS:
+    if key in CORE_FLAGS:
         errors.append(f"{where}: '{key}' is set by the harness, not the batch file")
     elif isinstance(value, bool) or not isinstance(value, (str, int, float)):
         errors.append(f"{where}: '{key}' must be a string or number, got {value!r}")

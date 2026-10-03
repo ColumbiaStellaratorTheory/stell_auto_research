@@ -1,5 +1,9 @@
 # autoresearch — a runner and logbook for optimization campaigns
 
+> **Start with `/setup-harness`, run with `/research <campaign>`** (Claude
+> Code). Setup wires your solver and writes the campaign; the research skill
+> runs the loop. You never write a system prompt.
+
 Autonomous AI agent harness for optimization campaigns. Fork of
 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) by
 [Andrej Karpathy](https://github.com/karpathy), adapted from LLM training to
@@ -24,15 +28,17 @@ contract.py               ← the harness↔adapter contract
 adapters/__init__.py      ← registry of installed adapters (static imports)
 adapters/<solver>.py      ← solver-specific glue (the only file that knows your solver)
 campaigns/<name>/
-  config.json             ← which adapter + its settings (solver paths, interpreter)
-  program.md              ← agent instructions for this campaign
-  LESSONS.md              ← append-only research memory (agent + human)
+  config.json             ← adapter, its settings, parameter constraints, budget
+  program.md              ← mission, goals + stopping criteria, rules code can't check
+  LESSONS.md              ← append-only campaign memory (agent + human)
   runs/<run-id>.json      ← one record per run: the source of truth
   blobs/                  ← evidence files (logs, results, solver patches) by content hash
   results.db              ← query index of runs/ (`runs` table + `results` view)
   batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, run ids
   claims/                 ← per-spec locks (a spec runs in one process at a time)
   scratch/                ← live run directories
+lessons/<adapter>.md      ← append-only solver memory, shared by every campaign on that adapter
+.claude/skills/research/  ← the research method: one copy for all campaigns
 ```
 
 A **campaign** is one research goal: one solver, one objective, one set of hard
@@ -40,9 +46,14 @@ limits. Each campaign keeps its own database, lessons and program file, so
 several campaigns can live side by side without mixing. Start a new campaign
 when the goal changes; new parameters for the same goal are just more runs.
 
-The agent reads the campaign's `program.md`, queries its `results.db` to see
-what's been tried, picks parameters, calls `run.py`, evaluates the result, and
-loops.
+The agent (via `/research <campaign>`) reads the campaign's `program.md` and
+lessons, gets a digest of what's been tried from `run.py brief`, plans a batch,
+runs it through `run.py`, records what it learned, and loops.
+
+Rules a computer can check are enforced in code — metric directions and
+solver validity by the adapter, parameter constraints and budget by `run.py`
+from `config.json`. Prose (`program.md`, lessons, the research skill) holds
+only judgment.
 
 ## Quick start
 
@@ -53,9 +64,17 @@ If you use Claude Code, the fastest path is the bundled setup skill:
 ```
 
 It finds your solver and the interpreter it runs in, **installs any missing
-dependencies**, detects your hardware, interviews you about your campaign,
-generates a solver adapter and a campaign folder, and ends with a real smoke
-run. You do not need to read anything below first.
+dependencies**, detects your hardware, interviews you about your campaign
+(goals, parameter limits, budget), generates a solver adapter and a campaign
+folder, and ends with a real smoke run. For a new goal on a solver that is
+already wired up, it skips straight to the campaign questions. Then:
+
+```
+/research <campaign>
+```
+
+starts the experiment loop, or resumes it in a later session. You do not need
+to read anything below first.
 
 To try the harness without any solver, use the toy adapter:
 
@@ -79,7 +98,12 @@ python run.py query "SELECT status, target, seed, objective_J FROM results"
 ```json
 {
   "adapter": "toy",
-  "env": {"SOLVER_ROOT": "/path/to/solver"}
+  "env": {"SOLVER_ROOT": "/path/to/solver"},
+  "plan_minutes": 30,
+  "max_parallel": 4,
+  "fixed":  {"dim": 4},
+  "bounds": {"step_size": [0.01, 1.0], "maxiter": [100, 5000]},
+  "budget": {"runs": 500, "hours": 24}
 }
 ```
 
@@ -88,10 +112,41 @@ python run.py query "SELECT status, target, seed, objective_J FROM results"
   interpreter that has your solver installed). A variable already set in your
   shell overrides the config value. This avoids shell-specific `export`
   syntax.
+- `plan_minutes`, `max_parallel` *(optional)* — planning interval and this
+  campaign's cap on runs at once (see [Machine budget](#machine-budget)).
+- `fixed` *(optional)* — parameters every run must use: each run's parsed
+  value (default included) must equal the given value, parsed by the
+  adapter's own flag.
+- `bounds` *(optional)* — inclusive `[min, max]` per numeric parameter; a
+  non-numeric or missing (`None`) value for a bounded parameter is a
+  violation. A parameter may appear in `fixed` or `bounds`, not both.
+- `budget` *(optional)* — `runs`: the number of run records in the campaign
+  (all statuses); `hours`: the sum of their recorded `elapsed` time. Usage is
+  counted from recorded runs, so runs already in flight when the budget is
+  reached can overshoot it by at most the number running at once.
+
+Keys in `fixed` / `bounds` are adapter parameter names exactly as used in
+batch specs (argparse dests, e.g. `step_size`). Unknown names, the adapter's
+execution flags, core flags, or malformed values are a config error when the
+campaign loads, and stop every command for that campaign until fixed. Absent keys mean no constraint. Enforcement:
+
+- A single run that breaks `fixed` / `bounds`, or starts after either budget
+  is exhausted, is refused before it executes (non-zero exit, nothing
+  recorded).
+- `batch` checks every spec up front, together with its other spec
+  validation, and refuses the whole batch on any violation, or when its new
+  (not yet recorded) runs exceed the remaining run budget (a promotion stage
+  counts at its maximum, top × replicates). While it runs, it stops launching
+  once either budget is spent (runs already going finish). `--dry-run` reports violations, remaining budget and the planned
+  new runs.
+- `replay` is exempt — it re-checks an existing record — but its run counts
+  toward the budget afterwards.
+- `brief` and `status` show the active `fixed` / `bounds` and the budget used
+  and remaining.
 
 `config.json` and the run data (`runs/`, `blobs/`, `results.db`, `scratch/`,
-`artifacts/`) are gitignored; `program.md` and `LESSONS.md` are yours to commit
-or not.
+`artifacts/`, `batches/`, `claims/`) are gitignored; `program.md` and
+`LESSONS.md` are yours to commit or not.
 
 ## Architecture: core + adapter
 
@@ -137,12 +192,12 @@ every run, so no flag is ever lost.
 | Command | What it does |
 |---------|--------------|
 | `python run.py [--campaign C] <adapter flags>` | run one experiment; prints a compact JSON summary (set fields, metrics, `on_front`, `crash_signature`) |
-| `python run.py brief [--campaign C]` | fixed-size digest: counts per mode/target, Pareto fronts over the adapter's goal metrics, recent runs, crash causes, replicate spread, runs since the front last moved, latest lessons |
+| `python run.py brief [--campaign C]` | fixed-size digest: counts per mode/target, Pareto fronts over the adapter's goal metrics, recent runs, crash causes, replicate spread, runs since the front last moved, latest campaign and solver lessons, active constraints and budget, run slots and batch sizing |
 | `python run.py query "SQL" [--limit N]` | one read-only SQL statement, tab-separated, capped (default 50 rows) |
 | `python run.py replay <run-id>` | re-run a recorded experiment and compare |
 | `python run.py rebuild` | regenerate `results.db` from `runs/` |
 | `python run.py batch FILE [--parallel N] [--dry-run]` | run a planned batch of experiments (below) |
-| `python run.py status [--max-parallel N] [--usable-cores C] [--usable-memory-gb M]` | hardware, machine settings and run slots, then every campaign: adapter, run counts, last run, runs since its front moved, measured run cost and sizing per mode; flags save machine settings |
+| `python run.py status [--max-parallel N] [--usable-cores C] [--usable-memory-gb M]` | hardware, machine settings and run slots, then every campaign: adapter, run counts, last run, runs since its front moved, constraints and budget, measured run cost and sizing per mode; flags save machine settings |
 
 A crashed run's `crash_signature` is the line in its log that names the failure
 (the last `...Error:` line, else the last line), with paths and numbers
@@ -175,14 +230,16 @@ finishes. The format is documented at the top of `batch.py`:
 - **Promotion:** a stage with `from` takes the best passing runs of an earlier
   stage (`"by"`: a goal metric, or `"front"` for the Pareto front), carries
   the named params, and records the source run as each new run's parent.
-- **Before anything runs** every spec is parsed against the adapter's flags;
-  any error stops the whole batch. `--dry-run` shows the plan and how many
-  runs are already recorded.
+- **Before anything runs** every spec is parsed against the adapter's flags
+  and checked against the campaign's `fixed` / `bounds` and run budget; any
+  error stops the whole batch. `--dry-run` shows the plan, how many runs are
+  already recorded, and the remaining budget.
 - **While it runs:** each distinct spec is its own `run.py` process (specs
   repeated in the file run once); specs already recorded are reused, not
   re-run; a spec another agent is running right now is waited for and then
   reused; launching stops once the last
-  `same_crash` runs crashed the same way (0 disables). Children's stderr goes
+  `same_crash` runs crashed the same way (0 disables), or once the hours
+  budget is spent. Children's stderr goes
   to `batches/<id>.log`, so the summary stays short.
 - **Waiting is free:** run it in the background and read the summary when it
   ends; SIGTERM (or Ctrl-C) cancels it, and each in-flight run records itself
@@ -213,8 +270,8 @@ batches run at once. Slots are lock files under `~/.autoresearch/slots`
 Slot capacity: `$AUTORESEARCH_MAX_PARALLEL`, else `machine.json`, else 1. A
 campaign's `config.json` may cap its own batches with `"max_parallel": N`.
 `run.py brief` repeats the per-mode sizing for its campaign. `/setup-harness`
-asks four questions (where runs execute, how much of the machine to use, how
-often to plan, session budget) and fills all of this in.
+asks where runs execute, how much of the machine to use and how often to
+plan, and fills all of this in; the run budget is the campaign's `budget`.
 
 ## Environment variables
 
@@ -252,14 +309,41 @@ jq 'select(.status=="pass")' campaigns/<name>/runs/*.json
 
 ## Autonomous agent usage
 
-Point your AI agent at the campaign's program file and let it go:
+In Claude Code:
 
 ```
-Read campaigns/<name>/program.md, then start the optimization loop.
+/research <name>
 ```
 
-The agent queries the database, picks experiments, runs them, evaluates results,
-records lessons, and repeats.
+The research skill (`.claude/skills/research/SKILL.md`) is the method shared by
+every campaign: start or resume from `program.md`, the lesson files and
+`run.py brief` (never from chat history); then brief → plan a batch →
+`--dry-run` → run → record lessons and distill → repeat, until the campaign's
+stopping criteria or budget end it. Each campaign's `program.md` holds only
+its mission, goals and stopping criteria, and the rules code cannot check
+(`templates/program_template.md`, about 30 lines). Other agents can be pointed
+at the skill file and the campaign's `program.md`.
+
+## Lessons
+
+Memory lives at three levels, all append-only (corrections are new entries):
+
+| Level | File | Changed by |
+|---|---|---|
+| Campaign | `campaigns/<name>/LESSONS.md` | the agent, after any finding that generalizes |
+| Solver | `lessons/<adapter>.md` (repo root, tracked) | the agent, by promotion from campaigns |
+| Method | `.claude/skills/research/SKILL.md` | the user only |
+
+Both lesson files use the entry format in `templates/LESSONS.md`; solver
+entries add a required `source:` field (campaign, campaign-lesson title, run
+ids). A campaign lesson is promoted to the solver file when it is `confirmed`
+and its scope does not depend on the campaign's goal; it is `confirmed` at
+solver level only once it holds in at least two campaigns, otherwise
+`hypothesis`. A confirmed parameter limit may become a `config.json` `bounds`
+entry, only after the user agrees. `run.py brief` lists the latest titles of
+both files (solver lessons in their own section; none when the adapter has
+no lessons file). `/setup-harness` creates `lessons/<adapter>.md` when it is
+missing.
 
 ## Adding a solver
 
@@ -294,10 +378,12 @@ adapter.py                      ← adapter lookup + contract check
 adapters/__init__.py            ← adapter registry (static imports)
 adapters/toy.py                 ← reference adapter (stdlib-only test functions)
 examples/toy_solver.py          ← the toy adapter's solver
-templates/program_template.md   ← skeleton for a campaign's program.md
-templates/LESSONS.md            ← scaffold for a campaign's LESSONS.md
+templates/program_template.md   ← skeleton for a campaign's program.md (~30 lines)
+templates/LESSONS.md            ← entry format for campaign and solver lessons
 campaigns/<name>/               ← one folder per campaign (created by /setup-harness)
-.claude/skills/setup-harness/   ← interactive first-time setup skill
+lessons/<adapter>.md            ← solver lessons, shared across campaigns (created by /setup-harness)
+.claude/skills/setup-harness/   ← interactive setup: new solver, or new campaign for an existing adapter
+.claude/skills/research/        ← the research loop, run with /research <campaign>
 ```
 
 ## Tests

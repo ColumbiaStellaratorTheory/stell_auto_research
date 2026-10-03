@@ -20,7 +20,9 @@ Usage (experiment flags come from the campaign's adapter; this shows the toy):
 `--campaign` (or $AUTORESEARCH_CAMPAIGN) may be omitted when exactly one
 campaign exists. Each run is written atomically to the campaign's
 runs/<run-id>.json — the source of truth — then indexed in results.db; a
-single-line JSON summary goes to stdout.
+single-line JSON summary goes to stdout. A run or batch that breaks the
+campaign's config.json `fixed` / `bounds`, or exceeds its `budget`, is refused
+before anything runs (exit 1).
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ import os
 import signal
 import sys
 from pathlib import Path
-from types import ModuleType
 
 import batch
 import machine
@@ -48,29 +49,6 @@ COMMANDS = ("replay", "rebuild", "brief", "query", "batch", "status")
 CANCELLED_EXIT = 143
 REPLAY_MISMATCH_EXIT = 2
 QUERY_DEFAULT_LIMIT = 50
-
-
-def build_parser(active: ModuleType, campaign: str | None) -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Run one optimization experiment")
-    p.add_argument(
-        "--campaign",
-        default=campaign,
-        help=f"campaign under campaigns/ (default: ${CAMPAIGN_ENV}, or the only campaign)",
-    )
-    p.add_argument(
-        "--replicate", type=int, default=0,
-        help="sample index of this spec; a new index draws a new derived seed (default 0)",
-    )
-    p.add_argument("--batch-id", default=None, help="set by `run.py batch`: the batch this run belongs to")
-    p.add_argument("--parent-run-id", default=None, help="the run this one builds on (set by batch promotion)")
-    p.add_argument(
-        "--mode",
-        choices=list(active.MODES),
-        default=active.MODES[0],
-        help="mode exposed by the campaign's adapter",
-    )
-    active.add_arguments(p)
-    return p
 
 
 def _status(argv: list[str]) -> int:
@@ -104,21 +82,22 @@ def _dispatch(command: str, argv: list[str]) -> int:
     config = load_config(campaign_dir)
     apply_env(config.env, os.environ)
     layout = resolve_layout(campaign_dir, os.environ)
+    active = load_adapter(config.adapter)
+    parser = runner.build_parser(active, selection.campaign)
+    limits = runner.resolve_limits(active, parser, config, campaign_dir)
 
     if command == "rebuild":
         p = argparse.ArgumentParser(description="Regenerate results.db from runs/*.json")
         p.add_argument("--campaign", default=selection.campaign)
         p.parse_args(argv)
-        rows = records.rebuild(layout, load_adapter(config.adapter))
+        rows = records.rebuild(layout, active)
         print(json.dumps({"campaign": campaign_dir.name, "rows": rows}))
         return 0
-
-    active = load_adapter(config.adapter)
     if command == "brief":
         p = argparse.ArgumentParser(description="Fixed-size digest of the campaign")
         p.add_argument("--campaign", default=selection.campaign)
         p.parse_args(argv)
-        print(runner.brief(active, layout, config, os.environ))
+        print(runner.brief(active, layout, config, limits, os.environ))
         return 0
     if command == "query":
         p = argparse.ArgumentParser(description="Run one read-only SQL statement on results.db")
@@ -128,8 +107,6 @@ def _dispatch(command: str, argv: list[str]) -> int:
         args = p.parse_args(argv)
         print(records.query(layout, active, args.sql, args.limit))
         return 0
-
-    parser = build_parser(active, selection.campaign)
     if command == "replay":
         p = argparse.ArgumentParser(description="Re-run a recorded experiment and compare")
         p.add_argument("run_id")
@@ -151,11 +128,12 @@ def _dispatch(command: str, argv: list[str]) -> int:
         check_required_env(active, os.environ, campaign_dir)
         slots = resolve_slots(os.environ)
         parallel = min(args.parallel or config.max_parallel or slots.capacity, config.max_parallel or slots.capacity, slots.capacity)
-        return runner.run_batch(active, layout, parser, campaign_dir.name, args.file, parallel, args.dry_run)
+        return runner.run_batch(active, layout, parser, campaign_dir.name, args.file, parallel, args.dry_run, limits)
 
     args = parser.parse_args(argv)
     check_required_env(active, os.environ, campaign_dir)
-    print(json.dumps(runner.run_once(active, layout, resolve_slots(os.environ), runner.with_seed(active, args))))
+    slots = resolve_slots(os.environ)
+    print(json.dumps(runner.run_once(active, layout, slots, runner.with_seed(active, args), limits)))
     return 0
 
 

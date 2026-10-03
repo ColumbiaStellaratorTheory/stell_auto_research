@@ -177,16 +177,27 @@ def _noise_lines(runs: Sequence[Mapping], goals: Goals) -> list[str]:
     ]
 
 
+def _lessons_line(label: str, titles: Sequence[str]) -> str:
+    if not titles:
+        return f"{label}: none yet"
+    return f"{label}: {len(titles)} entries; latest: {'; '.join(titles[-MAX_LESSON_TITLES:])}"
+
+
 def render_brief(
     campaign: str,
     adapter_name: str,
     runs: Sequence[Mapping],
     metric_goals: Mapping[str, str | None],
     lessons: Sequence[str],
+    solver_lessons: Sequence[str] | None = None,
+    limit_lines: Sequence[str] = (),
     machine_lines: Sequence[str] = (),
 ) -> str:
     """A fixed-size text digest of the campaign for the start of each loop iteration.
 
+    `lessons` and `solver_lessons` are lesson titles, oldest first, of the
+    campaign and of its solver (None: the solver has no lessons file, so the
+    line is omitted). `limit_lines` (constraints, budget) follow the head line;
     `machine_lines` (run slots, measured cost per mode, suggested batch size)
     are appended as given.
     """
@@ -195,9 +206,12 @@ def render_brief(
         f"campaign {campaign} · adapter {adapter_name} · {len(runs)} runs: "
         f"{counts['pass']} pass, {counts['fail']} fail, {counts['crash']} crash"
     )
+    lesson_lines = [_lessons_line("lessons", lessons)]
+    if solver_lessons is not None:
+        lesson_lines.append(_lessons_line("solver lessons", solver_lessons))
     if not runs:
-        return "\n".join([head, "no runs yet", *machine_lines])
-    lines = [head + f" · last {max(r['created_at'] for r in runs)[:19]}"]
+        return "\n".join([head, *limit_lines, "no runs yet", *lesson_lines, *machine_lines])
+    lines = [head + f" · last {max(r['created_at'] for r in runs)[:19]}", *limit_lines]
     goals_all = active_goals(runs, metric_goals)
     if goals_all:
         lines.append("goals: " + "  ".join(_goal_label(m, g) for m, g in goals_all))
@@ -253,10 +267,6 @@ def render_brief(
     lines.append(
         "front: none yet" if stall is None else f"runs since the newest front member: {stall}"
     )
-    if lessons:
-        shown = "; ".join(lessons[-MAX_LESSON_TITLES:])
-        lines.append(f"lessons: {len(lessons)} entries; latest: {shown}")
-    else:
-        lines.append("lessons: none yet")
+    lines.extend(lesson_lines)
     lines.extend(machine_lines)
     return "\n".join(lines)
