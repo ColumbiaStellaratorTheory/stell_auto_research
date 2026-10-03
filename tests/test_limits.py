@@ -338,6 +338,16 @@ class TestLimitsEndToEnd(_CliTest):
         record = json.loads(next((self.demo / "batches").glob("*.json")).read_text())
         self.assertEqual(record["status"], "stopped")
 
+    def test_batch_record_keeps_the_limits_it_ran_under(self):
+        self._config(fixed={"dim": 3}, bounds={"step_size": [0.01, 1.0]}, budget={"runs": 10})
+        proc = self._run("batch", str(self._plan({"base": {"problem": "sphere", "dim": 3, "maxiter": 50}})))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._config(bounds={"step_size": [0.5, 2.0]})
+        record = json.loads(next((self.demo / "batches").glob("*.json")).read_text())
+        self.assertEqual(record["limits"], {
+            "fixed": {"dim": 3}, "bounds": {"step_size": [0.01, 1.0]}, "budget": {"runs": 10, "hours": None},
+        })
+
     def test_batch_with_the_budget_already_spent_is_refused(self):
         self._config(budget={"hours": 1})
         self._seed_elapsed(3600.0)

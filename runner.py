@@ -26,7 +26,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, Mapping
@@ -188,6 +188,14 @@ class Limits:
                 f"{k} in [{analysis.fmt(lo)}, {analysis.fmt(hi)}]" for k, (lo, hi) in self.bounds.items()
             ))
         return " · ".join(parts) or "none"
+
+    def as_record(self) -> dict:
+        """The limits as JSON, stored in each batch record so its history survives later config changes."""
+        return {
+            "fixed": clean(dict(self.fixed)),
+            "bounds": clean(dict(self.bounds)),
+            "budget": asdict(self.budget),
+        }
 
 
 def _param_problem(active: ModuleType, defaults: Mapping[str, object], key: str) -> str | None:
@@ -898,7 +906,7 @@ def run_batch(
         "id": batch_id, "source": str(path), "sha256": sha256_file(path),
         "created_at": _now(),
         "hypothesis": plan.hypothesis, "lessons": plan.lessons, "parallel": parallel,
-        "batch": plan.raw, "status": "running", "stages": {},
+        "limits": limits.as_record(), "batch": plan.raw, "status": "running", "stages": {},
     }
     records.write_atomic(record_path, json.dumps(batch_record, indent=1).encode())
     log = layout.batches_dir / f"{batch_id}.log"

@@ -186,7 +186,7 @@ mode's measured run time, memory and threads, how many runs fit at once, and
 the batch size that fills one planning interval (`plan_minutes`). Size batches
 from those numbers. Every run from every campaign takes one machine-wide run
 slot, so the machine is never oversubscribed; `--parallel N` on a batch is
-capped by the campaign's `max_parallel` and the slots. Changing machine
+capped by the campaign's `max_parallel` (its `local.json`) and the slots. Changing machine
 settings (`run.py status --max-parallel …`) affects every campaign — leave it
 to the user.
 

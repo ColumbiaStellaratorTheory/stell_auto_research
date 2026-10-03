@@ -9,8 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Campaign runtime data and machine-specific campaign config
-campaigns/*/config.json
+# Campaign runtime data and machine-local campaign settings (config.json,
+# program.md and LESSONS.md are the research record: commit them)
+campaigns/*/local.json
 campaigns/*/results.db
 campaigns/*/results.db-shm
 campaigns/*/results.db-wal

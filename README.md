@@ -28,13 +28,14 @@ contract.py               ← the harness↔adapter contract
 adapters/__init__.py      ← registry of installed adapters (static imports)
 adapters/<solver>.py      ← solver-specific glue (the only file that knows your solver)
 campaigns/<name>/
-  config.json             ← adapter, its settings, parameter constraints, budget
+  config.json             ← experiment design: adapter, parameter constraints, budget (commit it)
+  local.json              ← this machine only: solver paths and other env, run cap (gitignored, optional)
   program.md              ← mission, goals + stopping criteria, rules code can't check
   LESSONS.md              ← append-only campaign memory (agent + human)
   runs/<run-id>.json      ← one record per run: the source of truth
   blobs/                  ← evidence files (logs, results, solver patches) by content hash
   results.db              ← query index of runs/ (`runs` table + `results` view)
-  batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, run ids
+  batches/<batch-id>.json ← each batch: its file, hash, hypothesis, cited lessons, limits, run ids
   claims/                 ← per-spec locks (a spec runs in one process at a time)
   scratch/                ← live run directories
 lessons/<adapter>.md      ← append-only solver memory, shared by every campaign on that adapter
@@ -93,27 +94,44 @@ python run.py query "SELECT status, target, seed, objective_J FROM results"
 - With exactly one campaign under `campaigns/`, it is selected automatically.
 - With several and none named, `run.py` refuses rather than guess.
 
+A campaign's settings are split by who they belong to. `config.json` is the
+experiment design — part of the research record, committed with
+`program.md` and `LESSONS.md`. `local.json` is what depends on this machine
+(paths, possibly secrets) — gitignored and optional. A key in the wrong file
+stops every command for the campaign with an error naming the file it
+belongs in; `SETTING_FILES` in `campaign.py` is the one list of which key
+lives where.
+
 `campaigns/<name>/config.json`:
 
 ```json
 {
   "adapter": "toy",
-  "env": {"SOLVER_ROOT": "/path/to/solver"},
   "plan_minutes": 30,
-  "max_parallel": 4,
   "fixed":  {"dim": 4},
   "bounds": {"step_size": [0.01, 1.0], "maxiter": [100, 5000]},
   "budget": {"runs": 500, "hours": 24}
 }
 ```
 
+`campaigns/<name>/local.json` *(optional)*:
+
+```json
+{
+  "env": {"SOLVER_ROOT": "/path/to/solver"},
+  "max_parallel": 4
+}
+```
+
 - `adapter` — a key in `adapters/__init__.py` `REGISTRY` (e.g. `"toy"`).
-- `env` *(optional)* — settings the adapter reads (solver paths, the
-  interpreter that has your solver installed). A variable already set in your
-  shell overrides the config value. This avoids shell-specific `export`
-  syntax.
-- `plan_minutes`, `max_parallel` *(optional)* — planning interval and this
-  campaign's cap on runs at once (see [Machine budget](#machine-budget)).
+- `plan_minutes` *(optional)* — how often the agent plans a new batch (see
+  [Machine budget](#machine-budget)).
+- `env` *(optional, local.json)* — settings the adapter reads (solver paths,
+  the interpreter that has your solver installed, credentials). A variable
+  already set in your shell overrides the local.json value. This avoids
+  shell-specific `export` syntax. Never put these in `config.json`.
+- `max_parallel` *(optional, local.json)* — this campaign's cap on runs at
+  once on this machine (see [Machine budget](#machine-budget)).
 - `fixed` *(optional)* — parameters every run must use: each run's parsed
   value (default included) must equal the given value, parsed by the
   adapter's own flag.
@@ -144,9 +162,12 @@ campaign loads, and stop every command for that campaign until fixed. Absent key
 - `brief` and `status` show the active `fixed` / `bounds` and the budget used
   and remaining.
 
-`config.json` and the run data (`runs/`, `blobs/`, `results.db`, `scratch/`,
-`artifacts/`, `batches/`, `claims/`) are gitignored; `program.md` and
-`LESSONS.md` are yours to commit or not.
+What to commit: `config.json`, `program.md` and `LESSONS.md` — the
+experiment's design, goals and memory. `local.json` and the run data
+(`runs/`, `blobs/`, `results.db`, `scratch/`, `artifacts/`, `batches/`,
+`claims/`) are gitignored. Each batch record stores the `fixed`, `bounds`
+and `budget` in effect when it ran, so a later change to `config.json` does
+not rewrite what earlier batches were allowed to do.
 
 ## Architecture: core + adapter
 
@@ -264,11 +285,11 @@ batches run at once. Slots are lock files under `~/.autoresearch/slots`
   since its front moved, and per mode the median run time, peak memory and
   threads of the recorded runs, how many fit at once (`usable cores ÷ threads`, capped by
   `usable memory ÷ peak memory`), and, with `"plan_minutes"` in the
-  campaign's config, the batch size that fills one planning interval
+  campaign's `config.json`, the batch size that fills one planning interval
   (`runs at once × planning interval ÷ run time`).
 
 Slot capacity: `$AUTORESEARCH_MAX_PARALLEL`, else `machine.json`, else 1. A
-campaign's `config.json` may cap its own batches with `"max_parallel": N`.
+campaign's `local.json` may cap its own batches with `"max_parallel": N`.
 `run.py brief` repeats the per-mode sizing for its campaign. `/setup-harness`
 asks where runs execute, how much of the machine to use and how often to
 plan, and fills all of this in; the run budget is the campaign's `budget`.
@@ -285,7 +306,7 @@ plan, and fills all of this in; the run budget is the campaign's `budget`.
 | `AUTORESEARCH_KEEP_ARTIFACTS` | *(optional)* retention for completed runs' outputs: `none` (default) / `pass` / `all`. Kept dirs move to `AUTORESEARCH_ARTIFACTS_DIR/<run-id>`. |
 | `AUTORESEARCH_ARTIFACTS_DIR` | *(optional)* where kept run dirs land, named by run id (default `campaigns/<name>/artifacts`). |
 
-Any of these can also go in a campaign's `config.json` `env` map.
+Any of these can also go in a campaign's `local.json` `env` map.
 
 ## Results
 
@@ -369,7 +390,7 @@ contract.py                     ← harness↔adapter contract: its docstring is
 run.py                          ← CLI: argument parsing and dispatch
 runner.py                       ← spec/seed/hash, run, replay, batch execution, brief and status
 records.py                      ← run files, evidence store, results.db (columns defined once), query
-campaign.py                     ← campaign selection, config.json, layout, env vars, run slots
+campaign.py                     ← campaign selection, config.json + local.json, layout, env vars, run slots
 analysis.py                     ← derived views: crash signatures, Pareto fronts, the brief
 batch.py                        ← batch files: validation, spec expansion, promotion, early stop
 locks.py                        ← OS-released file locks for run slots and spec claims

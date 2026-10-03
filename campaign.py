@@ -1,7 +1,7 @@
 """Which campaign a command acts on, how it is configured, and where its files live.
 
-Covers campaign selection, config.json (including its run budget), the
-campaign's directory layout, and the machine-wide run slots. Every environment
+Covers campaign selection, its settings (config.json and local.json, including
+the run budget), the campaign's directory layout, and the machine-wide run slots. Every environment
 variable the harness itself reads, and every flag the harness sets on a run, is
 named here.
 """
@@ -12,7 +12,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import Mapping, MutableMapping, Sequence
 
 import machine
@@ -20,6 +20,20 @@ from locks import release, try_lock
 
 REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_NAME = "config.json"
+LOCAL_NAME = "local.json"
+# Which file holds each campaign setting. config.json is the experiment design
+# and is committed with the research record; local.json holds what depends on
+# this machine (solver paths, possible secrets, its share of the run slots) and
+# is never committed. A key in the other file is an error naming this one.
+SETTING_FILES = MappingProxyType({
+    "adapter": CONFIG_NAME,
+    "fixed": CONFIG_NAME,
+    "bounds": CONFIG_NAME,
+    "budget": CONFIG_NAME,
+    "plan_minutes": CONFIG_NAME,
+    "env": LOCAL_NAME,
+    "max_parallel": LOCAL_NAME,
+})
 DB_NAME = "results.db"
 KEEP_ARTIFACTS_CHOICES = ("none", "pass", "all")
 # Flags the harness sets on every run (argparse dests): they select how it is
@@ -43,7 +57,7 @@ class HarnessError(Exception):
 
 
 class CampaignError(HarnessError):
-    """The campaign cannot be selected or its config.json is invalid."""
+    """The campaign cannot be selected or its config.json / local.json is invalid."""
 
 
 # ---------------------------------------------------------------------------
@@ -92,11 +106,12 @@ class Budget:
 
 @dataclass(frozen=True)
 class CampaignConfig:
-    """A campaign's config.json: which adapter it runs, default env vars, and its limits.
+    """A campaign's settings: which adapter it runs, its limits, and this machine's env vars.
 
-    `env` supplies adapter configuration (solver paths, interpreters) without
-    shell-specific export syntax; a variable already set in the environment
-    takes precedence over the config value. `max_parallel` caps how many of
+    SETTING_FILES says which file each comes from. `env` (local.json) supplies
+    adapter configuration (solver paths, interpreters) without shell-specific
+    export syntax; a variable already set in the environment takes precedence
+    over the local.json value. `max_parallel` (local.json) caps how many of
     the machine's run slots one batch of this campaign uses at once.
     `plan_minutes` is how often the agent plans a new batch; `brief` and
     `status` turn it into a suggested batch size. `fixed` (param → value every
@@ -189,26 +204,41 @@ def _parse_budget(path: Path, raw: object) -> Budget:
     return Budget(runs, hours)
 
 
-def load_config(campaign_dir: Path) -> CampaignConfig:
-    """Parse and validate a campaign's config.json."""
-    path = campaign_dir / CONFIG_NAME
+def _read_settings(path: Path) -> dict:
+    """The keys of one settings file, each checked to belong in it (see SETTING_FILES)."""
     try:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         raise CampaignError(f"cannot read {path}: {e}") from e
     if not isinstance(raw, dict):
         raise CampaignError(f"{path}: top level must be a JSON object")
+    for key in raw:
+        home = SETTING_FILES.get(key)
+        if home is None:
+            allowed = [k for k, name in SETTING_FILES.items() if name == path.name]
+            raise CampaignError(f"{path}: unknown key \"{key}\"; allowed: {allowed}")
+        if home != path.name:
+            raise CampaignError(f"{path}: \"{key}\" belongs in {path.with_name(home)}, not {path.name}")
+    return raw
+
+
+def load_config(campaign_dir: Path) -> CampaignConfig:
+    """Parse and validate a campaign's config.json and its optional local.json."""
+    path = campaign_dir / CONFIG_NAME
+    local_path = campaign_dir / LOCAL_NAME
+    raw = _read_settings(path)
+    local = _read_settings(local_path) if local_path.exists() else {}
     adapter_name = raw.get("adapter")
     if not isinstance(adapter_name, str) or not adapter_name:
         raise CampaignError(f"{path}: \"adapter\" must be a non-empty string")
-    env = raw.get("env", {})
+    env = local.get("env", {})
     if not isinstance(env, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in env.items()
     ):
-        raise CampaignError(f"{path}: \"env\" must map names to string values")
-    max_parallel = raw.get("max_parallel")
+        raise CampaignError(f"{local_path}: \"env\" must map names to string values")
+    max_parallel = local.get("max_parallel")
     if max_parallel is not None and (isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1):
-        raise CampaignError(f"{path}: \"max_parallel\" must be an integer >= 1")
+        raise CampaignError(f"{local_path}: \"max_parallel\" must be an integer >= 1")
     plan_minutes = raw.get("plan_minutes")
     if plan_minutes is not None and (isinstance(plan_minutes, bool) or not isinstance(plan_minutes, (int, float)) or plan_minutes <= 0):
         raise CampaignError(f"{path}: \"plan_minutes\" must be a number > 0")
@@ -224,7 +254,7 @@ def load_config(campaign_dir: Path) -> CampaignConfig:
 
 
 def apply_env(defaults: Mapping[str, str], environ: MutableMapping[str, str]) -> None:
-    """Set each config env var that the environment does not already define."""
+    """Set each local.json env var that the environment does not already define."""
     for key, value in defaults.items():
         environ.setdefault(key, value)
 
@@ -235,7 +265,7 @@ def check_required_env(active: ModuleType, environ: Mapping[str, str], campaign_
     if missing:
         raise HarnessError(
             f"adapter '{active.NAME}' needs {', '.join(missing)}: add to the \"env\" map in "
-            f"{campaign_dir / CONFIG_NAME} or set in the shell."
+            f"{campaign_dir / LOCAL_NAME} or set in the shell."
         )
 
 

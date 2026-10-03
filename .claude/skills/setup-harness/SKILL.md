@@ -13,8 +13,9 @@ wire it to their solver and prove it runs.
 
 The end state is these pieces, all verified by a real run:
 **adapter** (`adapters/<solver>.py`, the solver-specific glue) + **campaign
-folder** `campaigns/<slug>/` holding `config.json` (which adapter + its
-settings, parameter constraints, budget), `program.md` (~30 lines: mission,
+folder** `campaigns/<slug>/` holding `config.json` (the experiment design:
+which adapter, parameter constraints, budget; committed), `local.json` (this
+machine's adapter env and run cap; gitignored), `program.md` (~30 lines: mission,
 goals and stopping criteria, rules no code can check) and `LESSONS.md`
 (campaign memory) + **solver lessons** `lessons/<adapter>.md` (shared by every
 campaign on that adapter) + **run.py** (generic runner, untouched) + the
@@ -29,7 +30,7 @@ existing campaigns from `python run.py status`).
 - **New campaign for an existing adapter** — skip Phases 2–4, Phase 5's
   hardware questions 1–2, device probe and threads/timeout questions, and
   Phase 6 steps 1 and 3 (adapter and machine settings already exist). Take
-  `env` from an existing campaign on that adapter (show it and confirm), then
+  `env` from an existing campaign's `local.json` on that adapter (show it and confirm), then
   ask Phase 5's campaign questions (mission, goals, limits, budget, autonomy,
   planning interval, how it shares the machine; metric goals belong to the
   adapter and are not asked again), do Phase 6 steps 2, 4, 5 and 6, a smoke
@@ -48,7 +49,8 @@ Read these before asking anything:
    including the `RunContext` / `ExperimentOutcome` types it uses.
 2. `README.md` — how the generic core works: campaign selection
    (`--campaign`, one folder per campaign under `campaigns/`), `config.json`
-   (`adapter`, `env`, `fixed` / `bounds` / `budget`), how it calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
+   (`adapter`, `fixed` / `bounds` / `budget`, `plan_minutes`) and `local.json`
+   (`env`, `max_parallel`), how it calls the adapter, the run records (`runs/`, `blobs/`, `results.db`), spec
    hash / dedupe / derived seeds / replay, the artifact layout
    (`AUTORESEARCH_SCRATCH_DIR` / `AUTORESEARCH_KEEP_ARTIFACTS` /
    `AUTORESEARCH_ARTIFACTS_DIR`). Metrics are stored as JSON; the
@@ -63,7 +65,9 @@ Read these before asking anything:
    campaign will run under; do not repeat any of it in `program.md`.
 
 Do not read or write dotenv files; adapter settings go in the campaign's
-`config.json` `"env"` map (a variable set in the shell overrides it).
+`local.json` `"env"` map (a variable set in the shell overrides it). Never put
+paths, credentials or other secrets in `config.json`: it is committed as part
+of the research record, and `run.py` refuses an `env` key there.
 
 ## Phase 2 — Identify the solver stack
 
@@ -166,7 +170,8 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   3. **How often should the agent look at results and plan the next batch?**
      e.g. every 30 min / 2 h / overnight. Becomes `plan_minutes`.
   If other campaigns already exist (`python run.py status` lists them), also ask
-  **how this campaign shares the machine** — becomes its `max_parallel` cap.
+  **how this campaign shares the machine** — becomes its `max_parallel` cap
+  (in `local.json`).
   Also ask the solver's threads per run and timeout per mode.
 - **Devices the solver can actually use.** Do not count a GPU because it
   exists: run a tiny probe of the solver's framework on each candidate device
@@ -175,7 +180,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
   jnp.ones(3).sum())"`; check float64 if the solver needs it).
   Only devices that pass are offered. Several JAX runs per GPU need
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` (or a smaller
-  `XLA_CLIENT_MEM_FRACTION`) in the campaign's `env`, since JAX takes 75% of
+  `XLA_CLIENT_MEM_FRACTION`) in the campaign's `local.json` `env`, since JAX takes 75% of
   GPU memory at its first operation. On Apple Silicon the GPU shares RAM
   with the CPU: one memory budget, not two.
 - **Autonomy**: "never stop" until the budget or the goals end it, or bounded
@@ -205,15 +210,20 @@ freedom; physics findings belong in `LESSONS.md`, not here.
    - **Register it** in `adapters/__init__.py`: one import line and one
      `REGISTRY` entry. Do **not** edit `adapter.py`, `run.py` or any other
      core module.
-2. **`campaigns/<slug>/config.json`** — `{"adapter": "<key>", "env": {...},
-   "plan_minutes": P, "max_parallel": N, "fixed": {...}, "bounds": {...},
-   "budget": {"runs": R, "hours": H}}` from the interview: the adapter's
-   `REGISTRY` key; in `env` the solver root, interpreter, config dir, device
-   settings (e.g. the JAX memory variables) and any non-default
-   artifact-layout values; `plan_minutes` from question 3; `max_parallel`
-   only when the machine is shared between campaigns; `fixed` / `bounds` /
-   `budget` from the limits and budget answers. Omit anything left at
-   default or unconstrained. No shell exports are needed. Check it loads:
+2. **Campaign settings**, two files from the interview; omit anything left at
+   default or unconstrained. A key in the wrong file is a load error naming
+   the right one.
+   - **`campaigns/<slug>/config.json`** (experiment design, committed) —
+     `{"adapter": "<key>", "plan_minutes": P, "fixed": {...}, "bounds": {...},
+     "budget": {"runs": R, "hours": H}}`: the adapter's `REGISTRY` key;
+     `plan_minutes` from question 3; `fixed` / `bounds` / `budget` from the
+     limits and budget answers. No paths or secrets.
+   - **`campaigns/<slug>/local.json`** (this machine, gitignored; skip it
+     when empty) — `{"env": {...}, "max_parallel": N}`: in `env` the solver
+     root, interpreter, config dir, device settings (e.g. the JAX memory
+     variables), any credentials and any non-default artifact-layout values;
+     `max_parallel` only when the machine is shared between campaigns.
+   No shell exports are needed. Check they load:
    `python run.py brief --campaign <slug>` shows the constraints and budget.
 3. **Machine settings** — `python run.py status --usable-cores C
    --usable-memory-gb M --max-parallel N` from question 2. Start
@@ -263,7 +273,7 @@ freedom; physics findings belong in `LESSONS.md`, not here.
 
 Print a short, practical summary:
 - The adapter written (`adapters/<slug>.py`), the campaign folder
-  (`campaigns/<slug>/`: `config.json`, `program.md`, `LESSONS.md`) and the
+  (`campaigns/<slug>/`: `config.json`, `local.json`, `program.md`, `LESSONS.md`) and the
   solver lessons file (`lessons/<adapter>.md`, new or existing).
 - The active constraints (`fixed`, `bounds`) and budget.
 - Any adapter↔solver flag drift found and how it was resolved.
@@ -275,7 +285,8 @@ Print a short, practical summary:
 - **How to start the loop**: `/research <slug>` (it also resumes a stopped
   campaign).
 - Reminders: lesson files are append-only memory; `program.md` holds the
-  goals, `config.json` the enforced limits; query results with
+  goals, `config.json` the enforced limits (commit it with `program.md` and
+  `LESSONS.md`; `local.json` stays on this machine); query results with
   `python run.py query --campaign <slug> "SQL"`; re-run `/setup-harness` for a
   new campaign or solver (it creates a new campaign folder / adapter rather
   than overwriting).

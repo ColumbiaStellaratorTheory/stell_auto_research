@@ -45,10 +45,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 NO_LIMITS = runner.Limits({}, {}, campaign.Budget())
 
 
-def _make_campaign(root: Path, name: str, config: dict) -> Path:
+def _make_campaign(root: Path, name: str, config: dict, local: dict | None = None) -> Path:
+    """The campaign root/name with this config.json and, when given, this local.json."""
     campaign_dir = root / name
     campaign_dir.mkdir(parents=True)
     (campaign_dir / campaign.CONFIG_NAME).write_text(json.dumps(config))
+    if local is not None:
+        (campaign_dir / campaign.LOCAL_NAME).write_text(json.dumps(local))
     return campaign_dir
 
 
@@ -101,21 +104,59 @@ class TestResolveCampaign(_ScratchDirTest):
 
 
 class TestLoadConfig(_ScratchDirTest):
-    """config.json names the adapter and optional default env vars."""
+    """config.json names the adapter (experiment design); the optional local.json holds env vars and max_parallel."""
 
-    def test_adapter_and_env_are_read(self):
-        d = _make_campaign(self.root, "c", {"adapter": "toy", "env": {"SOLVER_ROOT": "/s"}})
+    def test_adapter_and_local_settings_are_read(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy"}, {"env": {"SOLVER_ROOT": "/s"}, "max_parallel": 2})
         config = campaign.load_config(d)
-        self.assertEqual((config.adapter, dict(config.env)), ("toy", {"SOLVER_ROOT": "/s"}))
+        self.assertEqual((config.adapter, dict(config.env), config.max_parallel), ("toy", {"SOLVER_ROOT": "/s"}, 2))
+
+    def test_local_json_is_optional(self):
+        config = campaign.load_config(_make_campaign(self.root, "c", {"adapter": "toy"}))
+        self.assertEqual((dict(config.env), config.max_parallel), ({}, None))
+
+    def test_local_key_in_config_json_names_local_json(self):
+        for key, value in (("env", {"SOLVER_ROOT": "/s"}), ("max_parallel", 2)):
+            d = self.root / key
+            d.mkdir()
+            (d / campaign.CONFIG_NAME).write_text(json.dumps({"adapter": "toy", key: value}))
+            with self.assertRaisesRegex(campaign.CampaignError, f'config.json: "{key}" belongs in .*/{key}/local.json'):
+                campaign.load_config(d)
+
+    def test_design_key_in_local_json_names_config_json(self):
+        for key, value in (("adapter", "toy"), ("fixed", {}), ("bounds", {}), ("budget", {}), ("plan_minutes", 5)):
+            d = self.root / key
+            d.mkdir()
+            (d / campaign.CONFIG_NAME).write_text(json.dumps({"adapter": "toy"}))
+            (d / campaign.LOCAL_NAME).write_text(json.dumps({key: value}))
+            with self.assertRaisesRegex(campaign.CampaignError, f'local.json: "{key}" belongs in .*/{key}/config.json'):
+                campaign.load_config(d)
+
+    def test_every_setting_lives_in_one_of_the_two_files(self):
+        self.assertEqual(set(campaign.SETTING_FILES.values()), {campaign.CONFIG_NAME, campaign.LOCAL_NAME})
+
+    def test_unknown_key_is_rejected_listing_the_files_keys(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy", "bound": {}})
+        with self.assertRaisesRegex(campaign.CampaignError, r'unknown key "bound"; allowed: \[\'adapter\''):
+            campaign.load_config(d)
+        d = _make_campaign(self.root, "l", {"adapter": "toy"}, {"envs": {}})
+        with self.assertRaisesRegex(campaign.CampaignError, r"local.json: unknown key \"envs\"; allowed: \['env', 'max_parallel'\]"):
+            campaign.load_config(d)
 
     def test_missing_adapter_is_rejected(self):
-        d = _make_campaign(self.root, "c", {"env": {}})
+        d = _make_campaign(self.root, "c", {})
         with self.assertRaisesRegex(campaign.CampaignError, '"adapter" must be a non-empty string'):
             campaign.load_config(d)
 
-    def test_non_string_env_value_is_rejected(self):
-        d = _make_campaign(self.root, "c", {"adapter": "toy", "env": {"THREADS": 4}})
-        with self.assertRaisesRegex(campaign.CampaignError, '"env" must map names to string values'):
+    def test_non_string_env_value_is_rejected_naming_local_json(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy"}, {"env": {"THREADS": 4}})
+        with self.assertRaisesRegex(campaign.CampaignError, 'local.json: "env" must map names to string values'):
+            campaign.load_config(d)
+
+    def test_malformed_local_json_is_rejected(self):
+        d = _make_campaign(self.root, "c", {"adapter": "toy"})
+        (d / campaign.LOCAL_NAME).write_text("{not json")
+        with self.assertRaisesRegex(campaign.CampaignError, "cannot read .*local.json"):
             campaign.load_config(d)
 
     def test_malformed_json_is_rejected(self):
@@ -127,7 +168,7 @@ class TestLoadConfig(_ScratchDirTest):
 
 
 class TestEnv(unittest.TestCase):
-    """Config env fills gaps; the shell wins; required vars are checked before a run."""
+    """local.json env fills gaps; the shell wins; required vars are checked before a run."""
 
     def test_shell_value_takes_precedence(self):
         environ = {"SOLVER_ROOT": "/from/shell"}
@@ -136,7 +177,7 @@ class TestEnv(unittest.TestCase):
 
     def test_missing_required_env_names_the_variables_and_config(self):
         needy = types.SimpleNamespace(NAME="needy", REQUIRED_ENV=("A", "B"))
-        with self.assertRaisesRegex(campaign.HarnessError, r"needs B: add to the \"env\" map in /c/config.json"):
+        with self.assertRaisesRegex(campaign.HarnessError, r"needs B: add to the \"env\" map in /c/local.json"):
             campaign.check_required_env(needy, {"A": "1"}, Path("/c"))
 
 
@@ -402,7 +443,8 @@ class _CliTest(_ScratchDirTest):
         self.campaigns = self.root / "campaigns"
         self.demo = _make_campaign(self.campaigns, "demo", {"adapter": "toy"})
 
-    def _run(self, *flags: str) -> subprocess.CompletedProcess:
+    def _run(self, *flags: str, shell_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        """run.py with these flags; `shell_env` adds variables set in the calling shell."""
         env = {
             **os.environ,
             campaign.CAMPAIGNS_DIR_ENV: str(self.campaigns),
@@ -412,13 +454,14 @@ class _CliTest(_ScratchDirTest):
         for inherited in (campaign.CAMPAIGN_ENV, campaign.KEEP_ARTIFACTS_ENV, campaign.ARTIFACTS_DIR_ENV,
                           campaign.SCRATCH_DIR_ENV):
             env.pop(inherited, None)
+        env.update(shell_env or {})
         return subprocess.run(
             [sys.executable, str(REPO_ROOT / "run.py"), *flags],
             capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=60,
         )
 
-    def _json(self, *flags: str) -> dict:
-        proc = self._run(*flags)
+    def _json(self, *flags: str, shell_env: dict[str, str] | None = None) -> dict:
+        proc = self._run(*flags, shell_env=shell_env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout)
 
@@ -500,10 +543,25 @@ class TestEndToEnd(_CliTest):
         self._json("--campaign", "other", "--problem", "sphere", "--maxiter", "50")
         self.assertEqual((len(self._run_files(other)), len(self._run_files())), (1, 0))
 
-    def test_config_env_is_applied_before_the_run(self):
-        kept = _make_campaign(self.campaigns, "keeper", {"adapter": "toy", "env": {campaign.KEEP_ARTIFACTS_ENV: "all"}})
+    def test_local_env_is_applied_before_the_run(self):
+        kept = _make_campaign(self.campaigns, "keeper", {"adapter": "toy"}, {"env": {campaign.KEEP_ARTIFACTS_ENV: "all"}})
         run_id = self._json("--campaign", "keeper", "--problem", "sphere", "--maxiter", "50")["id"]
         self.assertTrue((kept / "artifacts" / run_id / "results.json").exists())
+
+    def test_shell_env_overrides_local_env(self):
+        kept = _make_campaign(self.campaigns, "keeper", {"adapter": "toy"}, {"env": {campaign.KEEP_ARTIFACTS_ENV: "all"}})
+        self._json("--campaign", "keeper", "--problem", "sphere", "--maxiter", "50",
+                   shell_env={campaign.KEEP_ARTIFACTS_ENV: "none"})
+        self.assertFalse((kept / "artifacts").exists(), "the shell's 'none' wins over local.json's 'all'")
+
+    def test_local_max_parallel_caps_a_batch(self):
+        (self.demo / campaign.LOCAL_NAME).write_text(json.dumps({"max_parallel": 2}))
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps({"hypothesis": "h", "lessons": {"applies": [], "tests": [], "rejects": []},
+                                    "stages": [{"base": {"problem": "sphere", "maxiter": 50}}]}))
+        proc = self._run("batch", str(plan), "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("parallel 2", proc.stdout)
 
     def test_missing_required_env_stops_before_running(self):
         needy = types.ModuleType("needy")
@@ -665,8 +723,8 @@ class TestLocksAndSlots(_ScratchDirTest):
             campaign.load_config(d)
 
     def test_campaign_max_parallel_is_validated(self):
-        d = _make_campaign(self.root, "c", {"adapter": "toy", "max_parallel": 0})
-        with self.assertRaisesRegex(campaign.CampaignError, "max_parallel"):
+        d = _make_campaign(self.root, "c", {"adapter": "toy"}, {"max_parallel": 0})
+        with self.assertRaisesRegex(campaign.CampaignError, 'local.json: "max_parallel" must be an integer >= 1'):
             campaign.load_config(d)
 
     def test_claimed_spec_is_reported_in_progress(self):
@@ -715,6 +773,7 @@ class TestBatchEndToEnd(_CliTest):
         self.assertEqual(promoted, [(1,), (1,)], "each promoted run names its screen parent")
         record = json.loads((self.demo / "batches" / f"{batch_ids[0][0]}.json").read_text())
         self.assertEqual((record["status"], len(record["stages"]["screen"])), ("done", 3))
+        self.assertEqual(record["limits"], {"fixed": {}, "bounds": {}, "budget": {"runs": None, "hours": None}})
 
     def test_rerun_reuses_recorded_runs(self):
         plan = self._plan({"base": {"problem": "sphere", "maxiter": 50}, "grid": {"dim": [2, 3]}})
